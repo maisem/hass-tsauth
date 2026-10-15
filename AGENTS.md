@@ -1,0 +1,4 @@
+- Use established OIDC/JWT libraries, not homemade cryptography.
+- Preserve password fallback, browser-bound state, native MFA, and explicit issuer/subject account mappings.
+- Keep HA-private APIs isolated and version-checked. Never log credentials.
+- Run tests and lint before committing. Do not change live HA during development.
