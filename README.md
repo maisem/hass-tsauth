@@ -1,91 +1,78 @@
 # hass-tsauth
 
-**Log into Home Assistant with Tailscale.**
+**Log into Home Assistant with Tailscale. No OIDC server needed.**
 
-Install and update through **HACS**. This is a custom integration, not a Supervisor add-on.
+Requires **HA 2026.9.3 or 2026.10.1**, [HACS](https://www.hacs.xyz/docs/use/), and
+[Tailscale Serve](https://tailscale.com/kb/1312/serve) proxying your HTTPS tailnet
+address to HA. Keep your existing HA password login enabled.
 
-## Before you start
+## 1. Install
 
-- [ ] Home Assistant **2026.9.3** or **2026.10.1** (other versions are blocked).
-- [ ] [HACS installed](https://www.hacs.xyz/docs/use/).
-- [ ] A working [tsidp](https://github.com/tailscale/tsidp) server.
-- [ ] Tailscale connected on your phone/computer and Home Assistant.
-- [ ] An HTTPS address for Home Assistant.
+1. **HACS → ⋮ → Custom repositories**.
+2. Add `https://github.com/maisem/hass-tsauth`, category **Integration**.
+3. Download **Tailscale Login**. Configure below before restarting.
 
-## 1. Install with HACS
+## 2. Configure
 
-1. Open **HACS → ⋮ → Custom repositories**.
-2. Paste **`https://github.com/maisem/hass-tsauth`**.
-3. Choose **Integration**, then **Add**.
-4. Find **Tailscale Login** in HACS and click **Download**.
+Find your exact **Tailscale login name** in the Tailscale admin console
+(often your email, not your display name or numeric user ID).
+Find your **HA user ID** under **Developer Tools → States → person.… → user_id**.
+If missing, link that person to your existing account under **Settings → People**.
 
-Continue with the configuration below before restarting.
-
-## 2. Find your two user IDs
-
-**Tailscale user ID**
-
-On your own Tailscale-connected computer—not the HA server—run:
-
-```sh
-tailscale status --json
-```
-
-Copy the number in **`Self.UserID`**. Legacy tsidp uses `userid:` followed by
-that number as your login subject. If your tsidp gives you a different `sub`,
-use that exact value instead.
-
-**Home Assistant user ID**
-
-In HA, open **Developer Tools → States**, find your **`person.…`** entity,
-and copy its **`user_id`** attribute. If it is missing, link that person to your
-user under **Settings → People** first.
-
-## 3. Paste the config
-
-Add this to `/config/configuration.yaml`.
-**Replace the two addresses and the two user IDs:**
+Add to `/config/configuration.yaml`, replacing the examples:
 
 ```yaml
 tsidp:
-  issuer: https://YOUR-IDP.example.ts.net
+  auth_mode: headers
   base_url: https://YOUR-HA.example.ts.net
-  client_id: home-assistant-tsidp
+  trusted_proxies:
+    - "127.0.0.1"
   users:
-    "userid:YOUR_TAILSCALE_USER_ID": "YOUR_HOME_ASSISTANT_USER_ID"
+    "YOUR_EXACT_TAILSCALE_LOGIN": "YOUR_32_CHARACTER_HA_USER_ID"
 ```
 
-Use an existing HA account. Don't create a second account for this.
-If another SSO integration is configured, disable its config first.
+**Trust only Serve's actual TCP source IP.** `127.0.0.1` applies when Serve
+connects to `http://127.0.0.1:8123` in HA's host/network namespace. Container
+setups may differ; verify the address. No subnets or wildcards. This is separate
+from HA's `http.trusted_proxies` setting. Do not put another proxy that forwards
+untrusted identity headers behind the same trusted IP.
 
-## 4. Restart and sign in
+## 3. Restart and sign in
 
-1. Restart **Home Assistant**, not just the browser.
-2. Open your HA HTTPS address in a private browser window, with Tailscale on.
-3. You should go through tsidp and land back in HA.
+Restart **Home Assistant**. Open your HA HTTPS address from a **personal,
+untagged** Tailscale-connected phone/computer. Your existing **HA MFA still applies**.
+The HA frontend and official iOS/Android apps are supported.
 
-Your existing HA MFA still applies. The official iOS and Android apps are supported.
+## Troubleshooting
 
-## Updates
-
-Install **Tailscale Login** updates in HACS, then restart Home Assistant.
-Check that the release supports your HA version before updating HA itself.
-
-### Something went wrong?
-
-- **Need your password?** Click **Use Home Assistant password** on the error page.
-  Or append `&tsidp_local=1` to the `/auth/authorize?...` sign-in URL.
-- **Can't reach tsidp?** Check that HA itself can resolve and open the IDP address.
-- **Tagged-node error?** Sign in from your personal device, not a tagged server.
-- **Want to undo it?** Remove the `tsidp:` config block and restart HA.
-  You can then delete **Tailscale Login** in HACS and restart again.
+- **Password page?** Tagged devices have no personal identity. Check your exact
+  login mapping, Serve URL and proxy source IP. Missing/unmapped headers use passwords.
+- **Need password login?** Append `&tsidp_local=1` to `/auth/authorize?...`.
+- **Updates:** Update in HACS, then restart. Other HA versions are blocked.
+- **Remove:** Delete the `tsidp:` block, restart, then optionally remove in HACS.
 
 <details>
-<summary>Manual installation (without HACS)</summary>
+<summary>Upgrading from 0.1.x / legacy OIDC</summary>
 
-Download `tsidp-VERSION.zip` from **GitHub → Releases** (not `tsidp.zip`).
-Extract it and copy `custom_components/tsidp` into `/config/custom_components/`.
-Then follow steps 2–4 above. Updates require replacing that folder manually.
+For Serve, remove `issuer`, `client_id`, and `client_secret`; use the config above.
+Replace each old OIDC subject key (`userid:…`) with the exact Tailscale login;
+keep the same HA user ID. Existing credentials and refresh sessions are retained.
+Legacy OIDC still works with its old config (or explicit `auth_mode: oidc`),
+without `trusted_proxies`. Header mode does not contact the old IdP.
+
+</details>
+
+<details>
+<summary>Security and manual installation</summary>
+
+Serve strips incoming identity headers. Only an explicitly trusted transport peer
+can supply `Tailscale-User-Login`; forwarded IPs and direct LAN claims are ignored.
+Other software on that trusted host is inside the trust boundary. Restrict backend
+exposure where practical. Mappings are exact; no email inference or user creation.
+Native HA owns MFA, PKCE and tokens; arbitrary third-party clients get no silent SSO.
+
+Without HACS, download `tsidp-VERSION.zip` from GitHub Releases (not `tsidp.zip`),
+copy `custom_components/tsidp` into `/config/custom_components/`, configure and restart.
 
 </details>
 

@@ -28,11 +28,14 @@ class TsidpAuthProvider(AuthProvider):
         sessions: Any,
         bindings: Mapping[tuple[str, str], str],
         origin: str,
+        *,
+        header_identity: Any = None,
     ) -> None:
         super().__init__(hass, store, {"type": PROVIDER_TYPE, "name": self.DEFAULT_TITLE})
         self.sessions = sessions
         self.bindings = dict(bindings)
         self.origin = origin
+        self.header_identity = header_identity
         self._credential_lock = asyncio.Lock()
 
     async def async_login_flow(self, context=None):
@@ -104,6 +107,10 @@ class TsidpLoginFlow(LoginFlow):
         except (ValueError, SessionError):
             return self.async_abort(reason="invalid_auth")
         identity = ticket.identity
+        if self._auth_provider.header_identity is not None:
+            current_identity = self._auth_provider.header_identity.read(request)
+            if current_identity != identity:
+                return self.async_abort(reason="invalid_auth")
         if (
             self._auth_provider.bindings.get((identity.issuer, identity.subject))
             != ticket.ha_user_id

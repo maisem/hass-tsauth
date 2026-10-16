@@ -46,6 +46,7 @@ from custom_components.tsidp.ha_adapter import (
     TICKET_COOKIE,
     async_install,
 )
+from custom_components.tsidp.headers import LOGIN_HEADER, SERVE_ISSUER, HeaderIdentity
 from custom_components.tsidp.oidc import Authorization, Identity
 from custom_components.tsidp.session import SessionManager, new_browser_secret
 
@@ -100,7 +101,7 @@ async def runtime(tmp_path, request):
         if route.method == "GET"
     }
     mode = getattr(request, "param", None)
-    if mode in {"frozen", "setup_frozen"}:
+    if mode in {"frozen", "setup_frozen", "headers_frozen", "headers_setup_frozen"}:
         # Mirror HomeAssistantHTTP.start: middleware/application freeze, but
         # integrations may still register new routes using the public API.
         app.router.freeze = lambda: None
@@ -108,6 +109,12 @@ async def runtime(tmp_path, request):
         assert app.frozen and not app.router.frozen
     sessions = SessionManager()
     identity = Identity(issuer=ISSUER, subject="stable-owner-sub", name="Ignored", email=None)
+    header_policy = None
+    if mode and mode.startswith("headers"):
+        identity = Identity(
+            issuer=SERVE_ISSUER, subject="owner@example.test", name=None, email=None
+        )
+        header_policy = HeaderIdentity(("127.0.0.1",))
     authorization = Authorization(
         state=new_browser_secret(),
         nonce=new_browser_secret(),
@@ -118,7 +125,21 @@ async def runtime(tmp_path, request):
         begin=AsyncMock(return_value=authorization),
         complete=AsyncMock(return_value=identity),
     )
-    if mode in {"setup", "setup_frozen"}:
+    if mode in {"headers_setup", "headers_setup_frozen"}:
+        config = CONFIG_SCHEMA(
+            {
+                "tsidp": {
+                    "auth_mode": "headers",
+                    "base_url": ORIGIN,
+                    "trusted_proxies": ["127.0.0.1"],
+                    "users": {identity.subject: owner.id},
+                }
+            }
+        )
+        assert await async_setup(hass, config)
+        handle = hass.data["tsidp"]
+        sessions = handle.provider.sessions
+    elif mode in {"setup", "setup_frozen"}:
         config = CONFIG_SCHEMA(
             {"tsidp": {"issuer": ISSUER, "base_url": ORIGIN, "users": {identity.subject: owner.id}}}
         )
@@ -129,8 +150,9 @@ async def runtime(tmp_path, request):
             hass,
             oidc=oidc,
             sessions=sessions,
-            bindings={(ISSUER, identity.subject): owner.id},
+            bindings={(identity.issuer, identity.subject): owner.id},
             callback_url=ORIGIN + "/auth/tsidp/callback",
+            header_identity=header_policy,
         )
     client = TestClient(TestServer(app))
     await client.start_server()
@@ -164,6 +186,8 @@ def login_request(runtime, client_id, redirect_uri, *, pkce=None):
     )
     ticket = runtime.sessions.issue_ticket(runtime.identity, browser, runtime.owner.id, path)
     headers = {"Origin": ORIGIN, "Cookie": f"{BROWSER_COOKIE}={browser}; {TICKET_COOKIE}={ticket}"}
+    if runtime.provider.header_identity is not None:
+        headers[LOGIN_HEADER] = runtime.identity.subject
     body = {
         "client_id": client_id,
         "redirect_uri": redirect_uri,
@@ -173,6 +197,7 @@ def login_request(runtime, client_id, redirect_uri, *, pkce=None):
     return headers, body
 
 
+@pytest.mark.parametrize("runtime", [None, "headers", "headers_frozen"], indirect=True)
 @pytest.mark.parametrize(
     "client_id,redirect_uri",
     [
@@ -229,6 +254,7 @@ class TestMFA(MultiFactorAuthModule):
         return user_input.get("code") == "test-only-code"
 
 
+@pytest.mark.parametrize("runtime", [None, "headers", "headers_frozen"], indirect=True)
 async def test_native_ha_mfa_not_bypassed(runtime):
     runtime.hass.auth._mfa_modules["test"] = TestMFA(runtime.hass, {"type": "test"})
     client_id, redirect_uri = ORIGIN + "/", ORIGIN + "/?auth_callback=1"
@@ -265,7 +291,7 @@ async def test_original_password_provider_still_runs_its_native_challenge(runtim
     assert {"username", "password"}.issubset(fields)
 
 
-@pytest.mark.parametrize("runtime", [None, "frozen"], indirect=True)
+@pytest.mark.parametrize("runtime", [None, "frozen", "headers_frozen"], indirect=True)
 @pytest.mark.parametrize("flag", ["tsidp_local", "tsidp_resume"])
 async def test_real_file_authorize_html_loads_public_no_store_bridge(runtime, flag):
     query = (
@@ -366,7 +392,7 @@ async def test_frozen_ha_app_wraps_only_existing_routes_and_restores(runtime):
     assert await response.text() == NATIVE_HTML
 
 
-@pytest.mark.parametrize("runtime", ["unfrozen", "frozen"], indirect=True)
+@pytest.mark.parametrize("runtime", ["unfrozen", "frozen", "headers_frozen"], indirect=True)
 @pytest.mark.parametrize(
     "mode,expected,remember",
     [
@@ -423,7 +449,6 @@ async def test_actual_yaml_setup_passes_guard_and_keeps_existing_owner(runtime):
     assert len(await runtime.hass.auth.async_get_users()) == 1
 
 
-
 # RFC 7636 Appendix B vector, verified by HA's native TokenView, not our crypto.
 PKCE = {
     "code_challenge": "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
@@ -433,7 +458,7 @@ PKCE_VERIFIER = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
 
 
 @pytest.mark.skipif(__version__ != "2026.10.1", reason="Native PKCE added in 2026.10.1")
-@pytest.mark.parametrize("runtime", [None, "frozen"], indirect=True)
+@pytest.mark.parametrize("runtime", [None, "frozen", "headers", "headers_frozen"], indirect=True)
 @pytest.mark.parametrize("verifier", [None, "x" * 43, PKCE_VERIFIER])
 async def test_native_pkce_code_exchange_preserves_proof_and_existing_owner(runtime, verifier):
     client_id, redirect_uri = ORIGIN + "/", ORIGIN + "/?auth_callback=1"
@@ -474,6 +499,7 @@ async def test_native_pkce_code_exchange_preserves_proof_and_existing_owner(runt
     assert len(await runtime.hass.auth.async_get_users()) == 1
 
 
+@pytest.mark.parametrize("runtime", [None, "headers", "headers_frozen"], indirect=True)
 async def test_native_non_pkce_client_still_exchanges_code(runtime):
     client_id, redirect_uri = "https://home-assistant.io/android", "homeassistant://auth-callback"
     headers, body = login_request(runtime, client_id, redirect_uri)
@@ -547,6 +573,224 @@ async def test_native_pkce_survives_entire_oidc_handoff_and_mfa(runtime):
     assert response.status == 200, await response.json()
     assert len(runtime.owner.refresh_tokens) == 1
     assert len(await runtime.hass.auth.async_get_users()) == 1
+
+
+@pytest.mark.parametrize("runtime", ["headers_setup", "headers_setup_frozen"], indirect=True)
+@pytest.mark.parametrize("mfa", [False, True])
+async def test_headers_entire_handoff_native_tokens_and_optional_mfa(runtime, mfa):
+    """Only the transport is simulated: real HA creates credentials, MFA and tokens."""
+    if mfa:
+        runtime.hass.auth._mfa_modules["test"] = TestMFA(runtime.hass, {"type": "test"})
+    client_id, redirect_uri = ORIGIN + "/", ORIGIN + "/?auth_callback=1"
+    pkce = PKCE if __version__ == "2026.10.1" else {}
+    query = urlencode(
+        {"client_id": client_id, "redirect_uri": redirect_uri, "state": "a+b/=", **pkce}
+    )
+    response = await runtime.client.get(
+        URL("/auth/tsidp/start?" + query, encoded=True),
+        headers={LOGIN_HEADER: runtime.identity.subject},
+        allow_redirects=False,
+    )
+    assert response.status == 302
+    assert response.headers["Location"] == "/auth/authorize?" + query + "&tsidp_resume=1"
+    browser = response.cookies[BROWSER_COOKIE].value
+    ticket = response.cookies[TICKET_COOKIE].value
+    assert response.cookies[TICKET_COOKIE]["secure"]
+    assert response.cookies[TICKET_COOKIE]["httponly"]
+    assert response.cookies[TICKET_COOKIE]["samesite"] == "Lax"
+    runtime.oidc.begin.assert_not_awaited()
+    runtime.oidc.complete.assert_not_awaited()
+    response = await runtime.client.get("/auth/tsidp/callback?state=x&code=x")
+    assert response.status == 404  # Header mode installs no OIDC callback.
+    headers = {
+        "Origin": ORIGIN,
+        LOGIN_HEADER: runtime.identity.subject,
+        "Cookie": f"{BROWSER_COOKIE}={browser}; {TICKET_COOKIE}={ticket}",
+    }
+    body = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "handler": ["tsidp", None],
+        **pkce,
+    }
+    response = await runtime.client.post("/auth/login_flow", headers=headers, json=body)
+    result = await response.json()
+    if mfa:
+        assert result["type"] == "form" and result["step_id"] == "mfa", result
+        assert not runtime.owner.refresh_tokens
+        response = await runtime.client.post(
+            "/auth/login_flow/" + result["flow_id"],
+            headers={"Origin": ORIGIN},
+            json={"client_id": client_id, "code": "test-only-code"},
+        )
+        result = await response.json()
+    assert result["type"] == "create_entry", result
+    response = await runtime.client.post(
+        "/auth/token",
+        data={
+            "grant_type": "authorization_code",
+            "client_id": client_id,
+            "code": result["result"],
+            **({"code_verifier": PKCE_VERIFIER} if pkce else {}),
+        },
+    )
+    tokens = await response.json()
+    assert response.status == 200, tokens
+    assert tokens["ha_auth_provider"] == "tsidp"
+    assert tokens["refresh_token"] and tokens["access_token"]
+    assert len(runtime.owner.refresh_tokens) == 1
+    assert len(await runtime.hass.auth.async_get_users()) == 1
+    credentials = await runtime.provider.async_credentials()
+    assert len(credentials) == 1
+    assert credentials[0].data == {
+        "issuer": SERVE_ISSUER,
+        "subject": runtime.identity.subject,
+    }
+    response = await runtime.client.post("/auth/login_flow", headers=headers, json=body)
+    assert (await response.json())["reason"] == "restart_sso"
+
+
+@pytest.mark.parametrize("runtime", ["headers_setup_frozen"], indirect=True)
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {},
+        {LOGIN_HEADER: "unmapped@example.test"},
+        {LOGIN_HEADER: "OWNER@example.test"},
+        [(LOGIN_HEADER, "owner@example.test"), (LOGIN_HEADER, "owner@example.test")],
+    ],
+)
+async def test_header_absent_tagged_unmapped_or_duplicated_returns_password(runtime, headers):
+    query = urlencode({"client_id": ORIGIN + "/", "redirect_uri": ORIGIN + "/?auth_callback=1"})
+    response = await runtime.client.get(
+        URL("/auth/tsidp/start?" + query, encoded=True), headers=headers, allow_redirects=False
+    )
+    assert response.status == 302
+    assert response.headers["Location"] == "/auth/authorize?" + query + "&tsidp_local=1"
+    assert response.cookies[TICKET_COOKIE]["max-age"] == "0"
+    assert not runtime.sessions._tickets
+    assert not await runtime.provider.async_credentials()
+    assert not runtime.owner.refresh_tokens
+    response = await runtime.client.get(
+        URL(response.headers["Location"], encoded=True), allow_redirects=False
+    )
+    assert response.status == 200  # Local authorize HTML, not another SSO redirect.
+    assert response.cookies[MODE_COOKIE].value == "local"
+    response = await runtime.client.get(
+        "/auth/providers", headers={"Cookie": f"{MODE_COOKIE}=local"}
+    )
+    assert [provider["type"] for provider in (await response.json())["providers"]] == [
+        "homeassistant"
+    ]
+    response = await runtime.client.post(
+        "/auth/login_flow",
+        headers={"Origin": ORIGIN},
+        json={
+            "client_id": ORIGIN + "/",
+            "redirect_uri": ORIGIN + "/?auth_callback=1",
+            "handler": ["homeassistant", None],
+        },
+    )
+    assert (await response.json())["type"] == "form"
+
+
+@pytest.mark.parametrize("runtime", ["headers"], indirect=True)
+async def test_header_mapped_user_disabled_after_ticket_cannot_finish(runtime):
+    mapped = await runtime.hass.auth.async_create_user("Mapped non-owner")
+    runtime.provider.bindings[(SERVE_ISSUER, runtime.identity.subject)] = mapped.id
+    runtime.owner = mapped
+    headers, body = login_request(runtime, ORIGIN + "/", ORIGIN + "/?auth_callback=1")
+    await runtime.hass.auth.async_deactivate_user(mapped)
+    response = await runtime.client.post("/auth/login_flow", headers=headers, json=body)
+    result = await response.json()
+    assert result["type"] == "abort" and result["reason"] == "invalid_auth", result
+    assert not await runtime.provider.async_credentials()
+
+
+@pytest.mark.parametrize("runtime", ["headers"], indirect=True)
+async def test_headers_cannot_silently_authorize_arbitrary_indieauth_client(runtime):
+    query = urlencode(
+        {
+            "client_id": "https://attacker.test/",
+            "redirect_uri": "https://attacker.test/callback",
+        }
+    )
+    response = await runtime.client.get(
+        "/auth/tsidp/start?" + query,
+        headers={LOGIN_HEADER: runtime.identity.subject},
+        allow_redirects=False,
+    )
+    assert response.status == 403
+    assert not runtime.sessions._tickets
+    assert not await runtime.provider.async_credentials()
+
+
+@pytest.mark.parametrize("runtime", ["headers"], indirect=True)
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"client_id": "https://home-assistant.io/android"},
+        {"redirect_uri": "homeassistant://auth-callback"},
+        {"client_id": "https://attacker.test/", "redirect_uri": "https://attacker.test/callback"},
+    ],
+)
+async def test_header_ticket_cannot_switch_native_client_or_redirect(runtime, changes):
+    headers, body = login_request(runtime, ORIGIN + "/", ORIGIN + "/?auth_callback=1")
+    response = await runtime.client.post(
+        "/auth/login_flow", headers=headers, json={**body, **changes}
+    )
+    result = await response.json()
+    assert result["type"] == "abort" and result["reason"] == "invalid_auth", result
+    assert not await runtime.provider.async_credentials()
+
+
+@pytest.mark.parametrize("runtime", ["headers"], indirect=True)
+@pytest.mark.parametrize("kind", ["missing", "changed", "duplicate", "untrusted_peer"])
+async def test_header_identity_rechecked_on_native_post_even_with_valid_ticket(runtime, kind):
+    headers, body = login_request(runtime, ORIGIN + "/", ORIGIN + "/?auth_callback=1")
+    if kind == "missing":
+        del headers[LOGIN_HEADER]
+    elif kind == "changed":
+        headers[LOGIN_HEADER] = "attacker@example.test"
+    elif kind == "duplicate":
+        headers = [*headers.items(), (LOGIN_HEADER, runtime.identity.subject)]
+    else:
+        runtime.provider.header_identity = HeaderIdentity(("192.0.2.1",))
+        headers["X-Forwarded-For"] = "192.0.2.1"
+    response = await runtime.client.post("/auth/login_flow", headers=headers, json=body)
+    result = await response.json()
+    assert result["type"] == "abort" and result["reason"] == "invalid_auth", result
+    assert not runtime.owner.refresh_tokens
+    assert not await runtime.provider.async_credentials()
+
+
+@pytest.mark.parametrize("runtime", ["headers"], indirect=True)
+async def test_oidc_credentials_and_refresh_session_survive_header_mode(runtime):
+    # Existing credentials have the same provider type/id, but are not silently
+    # repurposed as header identities or removed when the mode changes.
+    credential = runtime.provider.async_create_credentials(
+        {"issuer": ISSUER, "subject": "old-oidc-subject"}
+    )
+    await runtime.hass.auth.async_link_user(runtime.owner, credential)
+    refresh = await runtime.hass.auth.async_create_refresh_token(
+        runtime.owner, ORIGIN + "/", credential=credential
+    )
+    headers, body = login_request(runtime, ORIGIN + "/", ORIGIN + "/?auth_callback=1")
+    response = await runtime.client.post("/auth/login_flow", headers=headers, json=body)
+    assert (await response.json())["type"] == "create_entry"
+    assert len(await runtime.provider.async_credentials()) == 2
+    response = await runtime.client.post(
+        "/auth/token",
+        data={
+            "grant_type": "refresh_token",
+            "client_id": ORIGIN + "/",
+            "refresh_token": refresh.token,
+        },
+    )
+    tokens = await response.json()
+    assert response.status == 200, tokens
+    assert tokens["access_token"]
+    assert runtime.hass.auth.async_get_refresh_token(refresh.id) is refresh
 
 
 async def test_exact_bundled_frontend_html_bridge_contract(runtime):

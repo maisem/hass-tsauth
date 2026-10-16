@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
 
+from .headers import SERVE_ISSUER, proxy_address, valid_login
+
 DOMAIN = "tsidp"
 DEFAULT_CLIENT_ID = "home-assistant-tsidp"
 
@@ -55,13 +57,15 @@ def canonical_origin(value: str) -> str:
 
 @dataclass(frozen=True)
 class Settings:
-    """Configuration for a single trusted issuer and the existing HA accounts it may use."""
+    """Explicit identity mode, origin, trust boundary and existing-account mappings."""
 
     issuer: str
     base_url: str
     client_id: str
     users: Mapping[str, str] = field(repr=False)
     client_secret: str | None = field(default=None, repr=False)
+    auth_mode: str = "oidc"
+    trusted_proxies: tuple[str, ...] = ()
 
     @property
     def callback_url(self) -> str:
@@ -76,10 +80,32 @@ class Settings:
         """Validate before touching any auth providers, routes or login state."""
         if not isinstance(data, Mapping):
             raise ValueError("tsidp configuration must be a mapping")
-        extra = set(data) - {"issuer", "base_url", "client_id", "client_secret", "users"}
+        extra = set(data) - {
+            "issuer",
+            "base_url",
+            "client_id",
+            "client_secret",
+            "users",
+            "auth_mode",
+            "trusted_proxies",
+        }
         if extra:
             raise ValueError("Unknown tsidp configuration option")
-        issuer = https_origin(data.get("issuer"), "issuer")
+        mode = data.get("auth_mode", "oidc")
+        if not isinstance(mode, str) or mode not in {"oidc", "headers"}:
+            raise ValueError("auth_mode must be oidc or headers")
+        proxies = data.get("trusted_proxies", [])
+        if mode == "headers":
+            if any(key in data for key in ("issuer", "client_id", "client_secret")):
+                raise ValueError("OIDC options must be removed in headers mode")
+            if not isinstance(proxies, list) or not 1 <= len(proxies) <= 16:
+                raise ValueError("trusted_proxies must list the exact Serve transport IPs")
+            proxies = tuple(str(proxy_address(value)) for value in proxies)
+            issuer = SERVE_ISSUER
+        else:
+            if "trusted_proxies" in data:
+                raise ValueError("trusted_proxies is only valid in headers mode")
+            issuer = https_origin(data.get("issuer"), "issuer")
         base_url = canonical_origin(https_origin(data.get("base_url"), "base_url"))
         client_id = data.get("client_id", DEFAULT_CLIENT_ID)
         if (
@@ -95,19 +121,20 @@ class Settings:
             raise ValueError("client_secret must be a nonempty secret string, or omitted")
         users = data.get("users")
         if not isinstance(users, Mapping) or not 1 <= len(users) <= 256:
-            raise ValueError("users must explicitly map OIDC subjects to existing HA user IDs")
+            raise ValueError("users must explicitly map identities to existing HA user IDs")
         for subject, user_id in users.items():
             if (
                 not isinstance(subject, str)
                 or not 1 <= len(subject) <= 512
                 or any(ord(c) < 32 for c in subject)
+                or (mode == "headers" and not valid_login(subject))
                 or not isinstance(user_id, str)
                 or re.fullmatch(r"[0-9a-f]{32}", user_id) is None
             ):
                 raise ValueError("users must map quoted subjects to 32-character HA user IDs")
         if len(set(users.values())) != len(users):
             raise ValueError("Only one Tailscale identity may be bound to each HA user")
-        return cls(issuer, base_url, client_id, dict(users), client_secret)
+        return cls(issuer, base_url, client_id, dict(users), client_secret, mode, tuple(proxies))
 
 
 def validate_mapping(data: Mapping[str, Any]) -> dict[str, Any]:

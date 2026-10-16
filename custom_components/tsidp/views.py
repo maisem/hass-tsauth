@@ -111,6 +111,26 @@ class StartView(HomeAssistantView):
             if not await indieauth.verify_redirect_uri(self.handle.hass, client_id, redirect_uri):
                 raise ValueError("Invalid redirect")
             browser = request.cookies.get(BROWSER_COOKIE) or new_browser_secret()
+            header_identity = self.handle.provider.header_identity
+            if header_identity is not None:
+                identity = header_identity.read(request)
+                user_id = (
+                    self.handle.provider.bindings.get((identity.issuer, identity.subject))
+                    if identity is not None
+                    else None
+                )
+                user = await self.handle.hass.auth.async_get_user(user_id) if user_id else None
+                if user is None or not user.is_active or user.system_generated:
+                    response = redirect(f"{return_path}&{LOCAL_FLAG}=1")
+                    cookie(response, TICKET_COOKIE, "", 0)
+                    return response
+                ticket = self.sessions.issue_ticket(
+                    identity, browser, user_id, return_path=return_path
+                )
+                response = redirect(f"{return_path}&{RESUME_FLAG}=1")
+                cookie(response, BROWSER_COOKIE, browser, 300)
+                cookie(response, TICKET_COOKIE, ticket, 60)
+                return response
             authorization = await self.oidc.begin()
             self.sessions.add(authorization, browser, return_path)
         except (ValueError, SessionError, OIDCError):

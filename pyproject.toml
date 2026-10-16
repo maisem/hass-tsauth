@@ -1,7 +1,7 @@
 [project]
 name = "ha-tsidp"
-version = "0.1.5"
-description = "Focused Tailscale OIDC authentication for Home Assistant"
+version = "0.2.0"
+description = "Tailscale Serve identity authentication for Home Assistant"
 requires-python = ">=3.12"
 dependencies = [
     "Authlib==1.9.1",

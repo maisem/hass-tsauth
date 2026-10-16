@@ -114,3 +114,53 @@ def test_ambiguous_origins_rejected(origin):
 
 def test_ipv6_origin_normalized_without_losing_brackets():
     assert Settings.from_mapping(config(base_url="https://[::1]:443/")).base_url == "https://[::1]"
+
+
+def header_config(**kwargs):
+    return {
+        "auth_mode": "headers",
+        "base_url": "https://ha.example.ts.net",
+        "trusted_proxies": ["127.0.0.1", "::1"],
+        "users": {"owner@example.test": USER},
+        **kwargs,
+    }
+
+
+def test_headers_needs_no_oidc_and_uses_separate_explicit_identity_namespace():
+    settings = Settings.from_mapping(header_config())
+    assert settings.auth_mode == "headers"
+    assert settings.bindings == {("tailscale-serve", "owner@example.test"): USER}
+    assert settings.trusted_proxies == ("127.0.0.1", "::1")
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"auth_mode": "anything"},
+        {"trusted_proxies": []},
+        {"trusted_proxies": "127.0.0.1"},
+        {"trusted_proxies": ["127.0.0.0/8"]},
+        {"trusted_proxies": ["localhost"]},
+        {"trusted_proxies": ["*"]},
+        {"issuer": "https://old.example"},
+        {"client_id": "old-client"},
+        {"client_secret": "old-secret"},
+        {"users": {" owner@example.test": USER}},
+        {"users": {"owner@example.test,attacker@example.test": USER}},
+    ],
+)
+def test_header_config_must_be_unambiguous_and_explicit(kwargs):
+    with pytest.raises(ValueError):
+        Settings.from_mapping(header_config(**kwargs))
+
+
+def test_headers_no_default_proxy_trust():
+    data = header_config()
+    del data["trusted_proxies"]
+    with pytest.raises(ValueError):
+        Settings.from_mapping(data)
+
+
+def test_oidc_rejects_silent_ignored_proxy_options():
+    with pytest.raises(ValueError):
+        Settings.from_mapping(config(trusted_proxies=["127.0.0.1"]))

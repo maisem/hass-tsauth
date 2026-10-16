@@ -1,6 +1,6 @@
 """Focused Tailscale identity authentication for Home Assistant.
 
-No OIDC credentials are linked by email/username, and no new HA users are
+No identities are linked by inferred email/username, and no new HA users are
 provisioned. Protocol/state modules remain independently testable.
 """
 
@@ -56,14 +56,21 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
             _LOGGER.error("tsidp user mapping refers to a missing, inactive or system HA account")
             return False
 
-    oidc = protocol.OIDCClient(
-        protocol.OIDCConfig(
-            issuer=settings.issuer,
-            client_id=settings.client_id,
-            callback_url=settings.callback_url,
-            client_secret=settings.client_secret,
+    oidc = None
+    header_identity = None
+    if settings.auth_mode == "headers":
+        from .headers import HeaderIdentity  # noqa: PLC0415
+
+        header_identity = HeaderIdentity(settings.trusted_proxies)
+    else:
+        oidc = protocol.OIDCClient(
+            protocol.OIDCConfig(
+                issuer=settings.issuer,
+                client_id=settings.client_id,
+                callback_url=settings.callback_url,
+                client_secret=settings.client_secret,
+            )
         )
-    )
     sessions = state.SessionManager()
     try:
         handle = await adapter.async_install(
@@ -72,6 +79,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
             sessions=sessions,
             bindings=settings.bindings,
             callback_url=settings.callback_url,
+            header_identity=header_identity,
         )
     except (RuntimeError, ValueError):
         _LOGGER.exception("Unable to install tsidp; keep the local password provider enabled")

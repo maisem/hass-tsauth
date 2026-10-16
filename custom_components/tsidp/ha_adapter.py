@@ -181,6 +181,7 @@ async def async_install(
     sessions: Any,
     bindings: Mapping[tuple[str, str], str],
     callback_url: str,
+    header_identity: Any = None,
 ) -> AdapterHandle:
     """Register once, during YAML setup, only on an exactly audited HA release."""
     from homeassistant.const import __version__
@@ -218,7 +219,12 @@ async def async_install(
     if parsed.username or parsed.password or parsed.path != "/auth/tsidp/callback":
         raise ValueError("callback_url must use /auth/tsidp/callback and no userinfo")
     provider = TsidpAuthProvider(
-        hass, hass.auth._store, sessions, bindings, f"{parsed.scheme}://{parsed.netloc}"
+        hass,
+        hass.auth._store,
+        sessions,
+        bindings,
+        f"{parsed.scheme}://{parsed.netloc}",
+        header_identity=header_identity,
     )
     await provider.async_initialize()
     handle = AdapterHandle(hass, provider)
@@ -245,7 +251,8 @@ async def async_install(
             app.middlewares.append(middleware)
             installed_middleware = True
         hass.http.register_view(StartView(handle, oidc, sessions))
-        hass.http.register_view(CallbackView(handle, oidc, sessions, bindings))
+        if header_identity is None:
+            hass.http.register_view(CallbackView(handle, oidc, sessions, bindings))
         hass.http.register_view(BridgeView(handle))
     except Exception:
         handle.disable()
