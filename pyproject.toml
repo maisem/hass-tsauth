@@ -1,6 +1,6 @@
 [project]
 name = "ha-tsidp"
-version = "0.1.1"
+version = "0.1.5"
 description = "Focused Tailscale OIDC authentication for Home Assistant"
 requires-python = ">=3.12"
 dependencies = [

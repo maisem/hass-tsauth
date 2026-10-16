@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 import voluptuous as vol
 
+from .compatibility import SUPPORTED_HA_DESCRIPTION, SUPPORTED_HA_VERSIONS
 from .configuration import DOMAIN, Settings, validate_mapping
 
 if TYPE_CHECKING:
@@ -26,13 +27,14 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     if DOMAIN not in config:
         return True
 
-    # These are the only HA internals we claim to support in this first build.
+    # These are the only exact HA releases whose private APIs we have audited.
     # Refuse untested versions before registering middleware or auth providers.
     from homeassistant.const import __version__  # noqa: PLC0415
 
-    if __version__ != "2026.9.3":
+    if __version__ not in SUPPORTED_HA_VERSIONS:
         _LOGGER.error(
-            "tsidp currently supports Home Assistant 2026.9.3 only; local login unchanged"
+            "tsidp supports Home Assistant %s only; local login unchanged",
+            SUPPORTED_HA_DESCRIPTION,
         )
         return False
 

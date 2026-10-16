@@ -81,7 +81,10 @@ class TsidpLoginFlow(LoginFlow):
                 request.cookies.get(BROWSER_COOKIE, ""),
             )
         except SessionError:
-            return self.async_abort(reason="invalid_auth")
+            # Native provider selection/start-over can arrive without a fresh
+            # one-use handoff. Only the authorize-page bridge restarts SSO;
+            # malformed origin/path/client checks still fail closed below.
+            return self.async_abort(reason="restart_sso")
         try:
             path = validate_authorize_path(ticket.return_path)
             expected = parse_qs(urlsplit(path).query, keep_blank_values=True)

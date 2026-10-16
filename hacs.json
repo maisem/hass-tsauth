@@ -1,5 +1,7 @@
 {
   "name": "Tailscale Login",
   "homeassistant": "2026.9.3",
-  "render_readme": true
+  "zip_release": true,
+  "filename": "tsidp.zip",
+  "hide_default_branch": true
 }

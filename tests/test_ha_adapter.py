@@ -13,7 +13,11 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 from yarl import URL
 
+from custom_components.tsidp import async_setup
+from custom_components.tsidp.compatibility import SUPPORTED_HA_VERSIONS
 from custom_components.tsidp.ha_adapter import (
+    BRIDGE_PATH,
+    BRIDGE_SCRIPT,
     BROWSER_COOKIE,
     LOCAL_FLAG,
     MODE_COOKIE,
@@ -104,7 +108,9 @@ def ha(monkeypatch):
     )
     app = web.Application()
     hass = SimpleNamespace(
-        auth=auth, http=SimpleNamespace(app=app, register_view=lambda view: None)
+        auth=auth,
+        http=SimpleNamespace(app=app, register_view=lambda view: None),
+        async_add_executor_job=AsyncMock(side_effect=lambda job: job()),
     )
     yield SimpleNamespace(
         hass=hass,
@@ -119,7 +125,7 @@ def ha(monkeypatch):
         sys.modules.pop(name, None)
 
 
-async def client_for(handle):
+async def client_for(handle, *, preselect_remember_me=True, include_tsidp=True):
     app = web.Application(middlewares=[make_middleware(handle)])
 
     async def authorize(request):
@@ -129,11 +135,11 @@ async def client_for(handle):
         return web.json_response(
             {
                 "providers": [
-                    {"type": "tsidp", "id": None},
+                    *([{"type": "tsidp", "id": None}] if include_tsidp else []),
                     {"type": "trusted_networks", "id": None},
                     {"type": "homeassistant", "id": None},
                 ],
-                "preselect_remember_me": True,
+                "preselect_remember_me": preselect_remember_me,
             }
         )
 
@@ -185,17 +191,37 @@ async def test_stock_page_bypasses_set_secure_scoped_mode(flag, mode):
         ("local", ["homeassistant", "trusted_networks"]),
         ("oidc", ["tsidp", "trusted_networks", "homeassistant"]),
         ("", ["tsidp", "trusted_networks", "homeassistant"]),
+        ("invalid", ["tsidp", "trusted_networks", "homeassistant"]),
+        (None, ["tsidp", "trusted_networks", "homeassistant"]),
     ],
 )
-async def test_provider_order_is_request_local(mode, expected):
-    client = await client_for(SimpleNamespace(enabled=True))
+@pytest.mark.parametrize("native_remember", [False, True])
+async def test_provider_order_and_remember_are_request_local(mode, expected, native_remember):
+    client = await client_for(SimpleNamespace(enabled=True), preselect_remember_me=native_remember)
     try:
-        response = await client.get("/auth/providers", headers={"Cookie": f"{MODE_COOKIE}={mode}"})
+        headers = {} if mode is None else {"Cookie": f"{MODE_COOKIE}={mode}"}
+        response = await client.get("/auth/providers", headers=headers)
         result = await response.json()
         assert [p["type"] for p in result["providers"]] == expected
-        assert result["preselect_remember_me"] is True
-        if mode:
+        assert result["preselect_remember_me"] is (native_remember or mode == "oidc")
+        if mode in {"local", "oidc"}:
             assert response.cookies[MODE_COOKIE]["max-age"] == "0"
+    finally:
+        await client.close()
+
+
+async def test_oidc_mode_without_tsidp_preserves_native_remember_preference():
+    client = await client_for(
+        SimpleNamespace(enabled=True), preselect_remember_me=False, include_tsidp=False
+    )
+    try:
+        response = await client.get("/auth/providers", headers={"Cookie": f"{MODE_COOKIE}=oidc"})
+        result = await response.json()
+        assert [p["type"] for p in result["providers"]] == [
+            "trusted_networks",
+            "homeassistant",
+        ]
+        assert result["preselect_remember_me"] is False
     finally:
         await client.close()
 
@@ -209,7 +235,123 @@ async def test_disabled_bridge_passthrough():
         await client.close()
 
 
-async def test_install_and_disable_only_own_provider(ha):
+@pytest.mark.parametrize("flag", [LOCAL_FLAG, RESUME_FLAG])
+@pytest.mark.parametrize("kind", ["response", "file"])
+async def test_authorize_html_gets_only_fixed_external_bridge(ha, tmp_path, flag, kind):
+    # The pinned modern loader dynamically imports from an inline classic
+    # script, so a deferred bridge is not guaranteed to run before it.
+    bootstrap = (
+        '<script crossorigin="use-credentials">import("/frontend_latest/authorize.js");</script>'
+    )
+    html = (
+        "<!doctype html><html><head><title>HA</title></head><body>native"
+        + bootstrap
+        + "</body></html>"
+    )
+    headers = {
+        "X-Core-Security": "preserved",
+        "Content-Length": "1",
+        "Content-Encoding": "gzip",
+        "ETag": '"old-native"',
+        "Last-Modified": "Wed, 14 Oct 2026 10:00:00 GMT",
+        "Cache-Control": "public, max-age=1000",
+    }
+    if kind == "file":
+        path = tmp_path / "authorize.html"
+        path.write_text(html)
+        native = web.FileResponse(path, headers=headers)
+    else:
+        native = web.Response(text=html, content_type="text/html", headers=headers)
+    native.set_cookie("native-cookie", "preserved")
+    handle = AdapterHandle(ha.hass, object())
+    middleware = make_middleware(handle)
+    response = await middleware(
+        make_mocked_request("GET", f"/auth/authorize?{QUERY}&{flag}=1"),
+        AsyncMock(return_value=native),
+    )
+    assert isinstance(response, web.Response)
+    assert response.content_type == "text/html"
+    assert response.text == html.replace("<head>", "<head>" + BRIDGE_SCRIPT)
+    # No defer, async, or type=module: this external classic script must block
+    # parsing before HA can reach its inline import/bootstrap.
+    assert BRIDGE_SCRIPT == f'<script src="{BRIDGE_PATH}"></script>'
+    assert response.text.index(BRIDGE_SCRIPT) < response.text.index(bootstrap)
+    assert QUERY not in response.text
+    assert response.headers["X-Core-Security"] == "preserved"
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.cookies["native-cookie"].value == "preserved"
+    assert response.cookies[MODE_COOKIE].value == ("local" if flag == LOCAL_FLAG else "oidc")
+    for header in ("Content-Length", "Content-Encoding", "ETag", "Last-Modified"):
+        assert header not in response.headers
+    if kind == "file":
+        ha.hass.async_add_executor_job.assert_awaited_once()
+    else:
+        ha.hass.async_add_executor_job.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "method,path,enabled",
+    [
+        ("GET", "/unrelated?tsidp_resume=1", True),
+        ("POST", "/auth/authorize?tsidp_resume=1", True),
+        ("GET", "/auth/providers", True),
+        ("GET", "/auth/authorize?tsidp_resume=1", False),
+    ],
+)
+async def test_bridge_never_injects_other_pages_methods_or_disabled(ha, method, path, enabled):
+    native = web.Response(text="<head></head><body>native</body>", content_type="text/html")
+    handle = AdapterHandle(ha.hass, object(), enabled=enabled)
+    response = await make_middleware(handle)(
+        make_mocked_request(method, path), AsyncMock(return_value=native)
+    )
+    assert response is native
+    assert BRIDGE_PATH not in response.text
+    ha.hass.async_add_executor_job.assert_not_awaited()
+
+
+@pytest.mark.parametrize("kind", ["plain", "json", "stream", "file", "explicit_plain_file"])
+async def test_authorize_non_html_unchanged(ha, tmp_path, kind):
+    if kind in {"file", "explicit_plain_file"}:
+        path = tmp_path / ("authorize.html" if kind == "explicit_plain_file" else "data.bin")
+        path.write_text("native")
+        native = web.FileResponse(path)
+        if kind == "explicit_plain_file":
+            native.content_type = "text/plain"
+    else:
+        native = {
+            "plain": web.Response(text="native"),
+            "json": web.json_response({"native": True}),
+            "stream": web.StreamResponse(),
+        }[kind]
+    response = await make_middleware(AdapterHandle(ha.hass, object()))(
+        make_mocked_request("GET", "/auth/authorize?tsidp_resume=1"),
+        AsyncMock(return_value=native),
+    )
+    assert response is native
+    ha.hass.async_add_executor_job.assert_not_awaited()
+
+
+async def test_public_bridge_asset_no_store_and_disabled(ha):
+    handle = AdapterHandle(ha.hass, object())
+    asset = ha.views.BridgeView(handle)
+    assert asset.url == BRIDGE_PATH and asset.requires_auth is False
+    response = await asset.get(make_mocked_request("GET", BRIDGE_PATH))
+    assert response.status == 200
+    assert response.content_type == "application/javascript"
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+    assert "pick-auth-provider" in response.text
+    assert "restart_sso" in response.text
+    ha.hass.async_add_executor_job.assert_awaited_once()
+    handle.disable()
+    response = await asset.get(make_mocked_request("GET", BRIDGE_PATH))
+    assert response.status == 404
+    assert response.headers["Cache-Control"] == "no-store"
+
+
+@pytest.mark.parametrize("version", SUPPORTED_HA_VERSIONS)
+async def test_install_and_disable_only_own_provider(ha, version):
+    sys.modules["homeassistant.const"].__version__ = version
     handle = await async_install(
         ha.hass, oidc=object(), sessions=SessionManager(), bindings={}, callback_url=CALLBACK
     )
@@ -218,6 +360,22 @@ async def test_install_and_disable_only_own_provider(ha):
     handle.disable()
     assert not handle.enabled
     assert list(ha.hass.auth._providers) == [("homeassistant", None)]
+
+
+@pytest.mark.parametrize("version", ["2026.9.2", "2026.9.30", "2026.10.0", "2026.10.2", "2027.1.0"])
+async def test_both_guards_reject_unaudited_versions_before_auth_or_http_changes(ha, version):
+    sys.modules["homeassistant.const"].__version__ = version
+    before = dict(ha.hass.auth._providers)
+    # The setup guard must run before any private imports, config validation,
+    # account lookups or middleware/view/provider registration.
+    assert await async_setup(ha.hass, {"tsidp": {}}) is False
+    with pytest.raises(RuntimeError, match="2026.9.3 or 2026.10.1"):
+        await async_install(
+            ha.hass, oidc=object(), sessions=SessionManager(), bindings={}, callback_url=CALLBACK
+        )
+    assert ha.hass.auth._providers == before
+    assert not ha.hass.http.app.middlewares
+    ha.hass.auth.async_get_user.assert_not_awaited()
 
 
 async def test_install_rejects_frozen_app_and_unknown_version(ha):
@@ -292,14 +450,86 @@ async def test_callback_resumes_native_flow_and_credential_links_existing_owner(
         }
         credential = await provider.async_get_or_create_credentials(result["data"])
         ha.hass.auth.async_link_user.assert_awaited_once_with(ha.user, credential)
-        assert (await ha.provider.TsidpLoginFlow(provider).async_step_init())["type"] == "abort"
+        replay = await ha.provider.TsidpLoginFlow(provider).async_step_init()
+        assert replay == {"type": "abort", "reason": "restart_sso"}
     finally:
         ha.request.reset(token)
     with pytest.raises(SessionError):
         sessions.consume_state(authorization.state, browser)
 
 
-async def test_provider_rejects_wrong_origin_without_consuming_ticket(ha):
+@pytest.mark.parametrize(
+    "method,path,origin",
+    [
+        ("POST", "/auth/login_flow", "https://attacker.test"),
+        ("GET", "/auth/login_flow", ORIGIN),
+        ("POST", "/auth/login_flow/other", ORIGIN),
+    ],
+)
+async def test_provider_rejects_wrong_request_without_consuming_ticket(ha, method, path, origin):
+    sessions = SessionManager()
+    browser = new_browser_secret()
+    identity = Identity(issuer=ISSUER, subject="s", name=None, email=None)
+    ticket = sessions.issue_ticket(identity, browser, "owner-id")
+    provider = ha.provider.TsidpAuthProvider(
+        ha.hass, ha.hass.auth._store, sessions, {(ISSUER, "s"): "owner-id"}, ORIGIN
+    )
+    request = make_mocked_request(
+        method,
+        path,
+        headers={
+            "Origin": origin,
+            "Cookie": f"{BROWSER_COOKIE}={browser}; {TICKET_COOKIE}={ticket}",
+        },
+    )
+    token = ha.request.set(request)
+    try:
+        assert await ha.provider.TsidpLoginFlow(provider).async_step_init() == {
+            "type": "abort",
+            "reason": "invalid_auth",
+        }
+    finally:
+        ha.request.reset(token)
+    assert sessions.consume_ticket(ticket, browser).ha_user_id == "owner-id"
+
+
+@pytest.mark.parametrize("kind", ["missing", "expired", "browser_mismatch"])
+async def test_ticket_session_errors_request_restart_without_authentication(ha, kind):
+    now = [100.0]
+    sessions = SessionManager(clock=lambda: now[0])
+    browser = new_browser_secret()
+    identity = Identity(issuer=ISSUER, subject="s", name=None, email=None)
+    ticket = sessions.issue_ticket(identity, browser, "owner-id", "/auth/authorize?" + QUERY)
+    if kind == "missing":
+        ticket = ""
+    elif kind == "expired":
+        now[0] += 61
+    else:
+        browser = new_browser_secret()
+    provider = ha.provider.TsidpAuthProvider(
+        ha.hass, ha.hass.auth._store, sessions, {(ISSUER, "s"): "owner-id"}, ORIGIN
+    )
+    request = make_mocked_request(
+        "POST",
+        "/auth/login_flow",
+        headers={
+            "Origin": ORIGIN,
+            "Cookie": f"{BROWSER_COOKIE}={browser}; {TICKET_COOKIE}={ticket}",
+        },
+    )
+    token = ha.request.set(request)
+    try:
+        assert await ha.provider.TsidpLoginFlow(provider).async_step_init() == {
+            "type": "abort",
+            "reason": "restart_sso",
+        }
+    finally:
+        ha.request.reset(token)
+    ha.hass.auth.async_link_user.assert_not_awaited()
+    ha.hass.auth.async_get_user.assert_not_awaited()
+
+
+async def test_consumed_ticket_missing_authorize_path_remains_invalid_auth(ha):
     sessions = SessionManager()
     browser = new_browser_secret()
     identity = Identity(issuer=ISSUER, subject="s", name=None, email=None)
@@ -311,16 +541,20 @@ async def test_provider_rejects_wrong_origin_without_consuming_ticket(ha):
         "POST",
         "/auth/login_flow",
         headers={
-            "Origin": "https://attacker.test",
+            "Origin": ORIGIN,
             "Cookie": f"{BROWSER_COOKIE}={browser}; {TICKET_COOKIE}={ticket}",
         },
     )
     token = ha.request.set(request)
     try:
-        assert (await ha.provider.TsidpLoginFlow(provider).async_step_init())["type"] == "abort"
+        assert await ha.provider.TsidpLoginFlow(provider).async_step_init() == {
+            "type": "abort",
+            "reason": "invalid_auth",
+        }
     finally:
         ha.request.reset(token)
-    assert sessions.consume_ticket(ticket, browser).ha_user_id == "owner-id"
+    with pytest.raises(SessionError):
+        sessions.consume_ticket(ticket, browser)
 
 
 async def test_invalid_client_rejected_before_oidc_and_no_new_user(ha):
@@ -363,7 +597,10 @@ async def test_ticket_cannot_authorize_another_client_or_redirect(ha, field, val
     )
     token = ha.request.set(request)
     try:
-        assert (await ha.provider.TsidpLoginFlow(provider).async_step_init())["type"] == "abort"
+        assert await ha.provider.TsidpLoginFlow(provider).async_step_init() == {
+            "type": "abort",
+            "reason": "invalid_auth",
+        }
     finally:
         ha.request.reset(token)
     with pytest.raises(SessionError):

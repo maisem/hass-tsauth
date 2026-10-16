@@ -10,3 +10,4 @@ dist/
 build/
 
 .venv-ha/
+.venv-ha-202610/

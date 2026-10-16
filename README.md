@@ -2,25 +2,24 @@
 
 **Log into Home Assistant with Tailscale.**
 
+Install and update through **HACS**. This is a custom integration, not a Supervisor add-on.
+
 ## Before you start
 
-- [ ] Home Assistant **2026.9.3**.
+- [ ] Home Assistant **2026.9.3** or **2026.10.1** (other versions are blocked).
+- [ ] [HACS installed](https://www.hacs.xyz/docs/use/).
 - [ ] A working [tsidp](https://github.com/tailscale/tsidp) server.
 - [ ] Tailscale connected on your phone/computer and Home Assistant.
 - [ ] An HTTPS address for Home Assistant.
 
-## 1. Copy the files
+## 1. Install with HACS
 
-1. On this GitHub page, click **Code → Download ZIP**.
-2. Unzip it.
-3. Copy the **`tsidp` folder inside `custom_components`** into Home Assistant's
-   `/config/custom_components/` folder. Use Studio Code Server or a Samba share.
+1. Open **HACS → ⋮ → Custom repositories**.
+2. Paste **`https://github.com/maisem/hass-tsauth`**.
+3. Choose **Integration**, then **Add**.
+4. Find **Tailscale Login** in HACS and click **Download**.
 
-**Check:** this file should now exist:
-
-```text
-/config/custom_components/tsidp/manifest.json
-```
+Continue with the configuration below before restarting.
 
 ## 2. Find your two user IDs
 
@@ -67,6 +66,11 @@ If another SSO integration is configured, disable its config first.
 
 Your existing HA MFA still applies. The official iOS and Android apps are supported.
 
+## Updates
+
+Install **Tailscale Login** updates in HACS, then restart Home Assistant.
+Check that the release supports your HA version before updating HA itself.
+
 ### Something went wrong?
 
 - **Need your password?** Click **Use Home Assistant password** on the error page.
@@ -74,5 +78,15 @@ Your existing HA MFA still applies. The official iOS and Android apps are suppor
 - **Can't reach tsidp?** Check that HA itself can resolve and open the IDP address.
 - **Tagged-node error?** Sign in from your personal device, not a tagged server.
 - **Want to undo it?** Remove the `tsidp:` config block and restart HA.
+  You can then delete **Tailscale Login** in HACS and restart again.
+
+<details>
+<summary>Manual installation (without HACS)</summary>
+
+Download `tsidp-VERSION.zip` from **GitHub → Releases** (not `tsidp.zip`).
+Extract it and copy `custom_components/tsidp` into `/config/custom_components/`.
+Then follow steps 2–4 above. Updates require replacing that folder manually.
+
+</details>
 
 MIT licensed.

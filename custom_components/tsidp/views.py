@@ -1,9 +1,10 @@
-"""Two integration-owned redirect views; no HA token/auth-code implementation."""
+"""Integration-owned redirects and restart asset; no HA token/code implementation."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from html import escape
+from pathlib import Path
 from typing import Any
 
 from aiohttp import web
@@ -13,6 +14,7 @@ from homeassistant.components.http import HomeAssistantView
 from .clients import is_trusted_client
 from .ha_adapter import (
     AUTHORIZE_PATH,
+    BRIDGE_PATH,
     BROWSER_COOKIE,
     LOCAL_FLAG,
     RESUME_FLAG,
@@ -55,6 +57,27 @@ def _one(query, name: str, *, required: bool = True) -> str:
     if len(values) > 1 or (required and (not values or not values[0])):
         raise ValueError("Invalid authorization parameters")
     return values[0] if values else ""
+
+
+class BridgeView(HomeAssistantView):
+    """Public same-origin script loaded only by the native authorize HTML."""
+
+    url = BRIDGE_PATH
+    name = "tsidp:bridge"
+    requires_auth = False
+
+    def __init__(self, handle: Any) -> None:
+        self.handle = handle
+
+    async def get(self, request: web.Request) -> web.StreamResponse:
+        if not self.handle.enabled:
+            return private_response(web.Response(status=404))
+        body = await self.handle.hass.async_add_executor_job(
+            Path(__file__).with_name("frontend.js").read_bytes
+        )
+        response = web.Response(body=body, content_type="application/javascript")
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        return private_response(response)
 
 
 class StartView(HomeAssistantView):
