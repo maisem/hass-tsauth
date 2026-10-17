@@ -6,7 +6,7 @@ import importlib
 import sys
 from contextvars import ContextVar
 from types import ModuleType, SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from aiohttp import web
@@ -53,6 +53,8 @@ def ha(monkeypatch):
         pass
 
     class AuthProvider:
+        support_mfa = True
+
         def __init__(self, hass, store, config):
             self.hass, self.store, self.config = hass, store, config
 
@@ -63,7 +65,7 @@ def ha(monkeypatch):
             return self.store.credentials
 
         def async_create_credentials(self, data):
-            return SimpleNamespace(data=data)
+            return SimpleNamespace(data=data, is_new=True)
 
     class LoginFlow:
         def __init__(self, provider):
@@ -82,8 +84,17 @@ def ha(monkeypatch):
     module("homeassistant.const", __version__="2026.9.3")
     module("homeassistant.auth", InvalidAuthError=InvalidAuthError)
     module("homeassistant.auth.providers", AuthProvider=AuthProvider, LoginFlow=LoginFlow)
-    module("homeassistant.helpers")
+    issues = SimpleNamespace(
+        async_create_issue=Mock(),
+        async_delete_issue=Mock(),
+        IssueSeverity=SimpleNamespace(ERROR="error"),
+    )
+    module("homeassistant.helpers", issue_registry=issues)
     module("homeassistant.helpers.http", current_request=current_request)
+    module(
+        "homeassistant.helpers.importlib",
+        async_import_module=AsyncMock(side_effect=lambda hass, name: importlib.import_module(name)),
+    )
     module("homeassistant.components")
     module("homeassistant.components.http", HomeAssistantView=type("HomeAssistantView", (), {}))
     indieauth = SimpleNamespace(
@@ -96,6 +107,10 @@ def ha(monkeypatch):
     provider = importlib.import_module(names[0])
     views = importlib.import_module(names[1])
     user = SimpleNamespace(id="owner-id", is_active=True, system_generated=False)
+
+    async def link_user(user, credential):
+        credential.is_new = False
+
     store = SimpleNamespace(credentials=[])
     providers = {("homeassistant", None): object()}
     auth = SimpleNamespace(
@@ -104,14 +119,17 @@ def ha(monkeypatch):
         get_auth_provider=lambda *key: providers.get(key),
         async_get_user=AsyncMock(return_value=user),
         async_get_user_by_credentials=AsyncMock(return_value=user),
-        async_link_user=AsyncMock(),
+        async_link_user=AsyncMock(side_effect=link_user),
     )
     app = web.Application()
     hass = SimpleNamespace(
         auth=auth,
+        data={},
         http=SimpleNamespace(app=app, register_view=lambda view: None),
         async_add_executor_job=AsyncMock(side_effect=lambda job: job()),
     )
+    # Installed official code is checked separately, including in real-HA tests.
+    monkeypatch.setattr("custom_components.tsidp.ha_adapter.check_runtime_contracts", lambda: None)
     yield SimpleNamespace(
         hass=hass,
         provider=provider,
@@ -120,6 +138,7 @@ def ha(monkeypatch):
         indieauth=indieauth,
         user=user,
         error=InvalidAuthError,
+        issues=issues,
     )
     for name in names:
         sys.modules.pop(name, None)
@@ -362,30 +381,66 @@ async def test_install_and_disable_only_own_provider(ha, version):
     assert list(ha.hass.auth._providers) == [("homeassistant", None)]
 
 
-@pytest.mark.parametrize("version", ["2026.9.2", "2026.9.30", "2026.10.0", "2026.10.2", "2027.1.0"])
-async def test_both_guards_reject_unaudited_versions_before_auth_or_http_changes(ha, version):
+@pytest.mark.parametrize("version", ["2026.10.3", "2026.11.0", "2027.1.0", "2027.1.0b1"])
+async def test_future_versions_with_good_contracts_install_with_audit_warning(ha, version, caplog):
     sys.modules["homeassistant.const"].__version__ = version
+    config = {
+        "tsidp": {
+            "auth_mode": "headers",
+            "base_url": ORIGIN,
+            "trusted_proxies": ["127.0.0.1"],
+            "users": {"owner@example.test": "a" * 32},
+        }
+    }
+    assert await async_setup(ha.hass, config) is True
+    assert ha.hass.auth.get_auth_provider("tsidp", None) is ha.hass.data["tsidp"].provider
+    assert "has not been audited" in caplog.text
+    ha.issues.async_create_issue.assert_not_called()
+    ha.issues.async_delete_issue.assert_called_once()
+
+
+async def test_changed_contract_refuses_before_auth_or_http_mutation(ha, monkeypatch):
+    def fail_contract():
+        raise RuntimeError("Changed runtime contract: native MFA")
+
+    monkeypatch.setattr("custom_components.tsidp.ha_adapter.check_runtime_contracts", fail_contract)
     before = dict(ha.hass.auth._providers)
-    # The setup guard must run before any private imports, config validation,
-    # account lookups or middleware/view/provider registration.
-    assert await async_setup(ha.hass, {"tsidp": {}}) is False
-    with pytest.raises(RuntimeError, match="2026.9.3 or 2026.10.1"):
+    with pytest.raises(RuntimeError, match="Changed runtime contract"):
         await async_install(
             ha.hass, oidc=object(), sessions=SessionManager(), bindings={}, callback_url=CALLBACK
         )
     assert ha.hass.auth._providers == before
     assert not ha.hass.http.app.middlewares
-    ha.hass.auth.async_get_user.assert_not_awaited()
 
 
-async def test_install_rejects_frozen_app_and_unknown_version(ha):
+async def test_setup_contract_failure_stays_loaded_with_persistent_password_repair(ha, monkeypatch):
+    def fail_contract():
+        raise RuntimeError("Changed runtime contract: native MFA")
+
+    monkeypatch.setattr("custom_components.tsidp.ha_adapter.check_runtime_contracts", fail_contract)
+    config = {
+        "tsidp": {
+            "auth_mode": "headers",
+            "base_url": ORIGIN,
+            "trusted_proxies": ["127.0.0.1"],
+            "users": {"owner@example.test": "a" * 32},
+        }
+    }
+    assert await async_setup(ha.hass, config) is True
+    assert "native MFA" in ha.hass.data["tsidp"]["compatibility_error"]
+    assert list(ha.hass.auth._providers) == [("homeassistant", None)]
+    assert not ha.hass.http.app.middlewares
+    call = ha.issues.async_create_issue.call_args
+    assert call.args[1:] == ("tsidp", "runtime_compatibility")
+    assert call.kwargs["is_persistent"] is True
+    assert call.kwargs["severity"] == "error"
+    assert "native MFA" in call.kwargs["translation_placeholders"]["reason"]
+    ha.issues.async_delete_issue.assert_not_called()
+
+
+async def test_install_rejects_frozen_router(ha):
     ha.hass.http.app.freeze()
     with pytest.raises(RuntimeError, match="frozen HTTP router"):
-        await async_install(
-            ha.hass, oidc=object(), sessions=SessionManager(), bindings={}, callback_url=CALLBACK
-        )
-    sys.modules["homeassistant.const"].__version__ = "2026.10.0"
-    with pytest.raises(RuntimeError, match="2026.9.3"):
         await async_install(
             ha.hass, oidc=object(), sessions=SessionManager(), bindings={}, callback_url=CALLBACK
         )
@@ -717,3 +772,55 @@ async def test_disable_does_not_overwrite_another_route_wrapper(ha):
     handle.disable()
     assert route.handler is later
     assert ha.hass.auth.get_auth_provider("tsidp", None) is None
+
+
+async def test_native_provider_must_still_support_mfa_before_registration(ha):
+    ha.provider.AuthProvider.support_mfa = False
+    with pytest.raises(RuntimeError, match="MFA support"):
+        await async_install(
+            ha.hass, oidc=object(), sessions=SessionManager(), bindings={}, callback_url=CALLBACK
+        )
+    assert list(ha.hass.auth._providers) == [("homeassistant", None)]
+    assert not ha.hass.http.app.middlewares
+
+
+@pytest.mark.parametrize("reused", [False, True])
+@pytest.mark.parametrize("failure", ["new", "unlinked", "other_user", "inactive", "system"])
+async def test_native_mfa_credential_link_invariants(ha, reused, failure):
+    data = {"issuer": ISSUER, "subject": "stable", "ha_user_id": ha.user.id}
+    provider = ha.provider.TsidpAuthProvider(
+        ha.hass, ha.hass.auth._store, SessionManager(), {(ISSUER, "stable"): ha.user.id}, ORIGIN
+    )
+    if reused:
+        ha.hass.auth._store.credentials = [
+            SimpleNamespace(data={"issuer": ISSUER, "subject": "stable"}, is_new=False)
+        ]
+    if failure == "new":
+        if reused:
+            ha.hass.auth._store.credentials[0].is_new = True
+        else:
+            ha.hass.auth.async_link_user.side_effect = None
+    else:
+        linked = SimpleNamespace(id=ha.user.id, is_active=True, system_generated=False)
+        if failure == "unlinked":
+            linked = None
+        elif failure == "other_user":
+            linked.id = "another-user"
+        elif failure == "inactive":
+            linked.is_active = False
+        else:
+            linked.system_generated = True
+        ha.hass.auth.async_get_user_by_credentials.return_value = linked
+    with pytest.raises(ha.error, match="active bound account"):
+        await provider.async_get_or_create_credentials(data)
+
+
+@pytest.mark.parametrize(
+    "failure", [ImportError("changed adapter import"), TypeError("changed API")]
+)
+async def test_setup_import_failure_stays_loaded_and_creates_repair(ha, failure):
+    sys.modules["homeassistant.helpers.importlib"].async_import_module.side_effect = failure
+    assert await async_setup(ha.hass, {"tsidp": {}}) is True
+    assert "compatibility_error" in ha.hass.data["tsidp"]
+    assert list(ha.hass.auth._providers) == [("homeassistant", None)]
+    ha.issues.async_create_issue.assert_called_once()

@@ -1,4 +1,4 @@
-"""Small, version-pinned adapter for HA's private provider registration.
+"""Small, runtime-contract-checked adapter for HA's private provider registration.
 
 Only the two exact GET paths below are wrapped. HA owns all login-flow, MFA,
 authorization-code issuance and token endpoints. Frozen HA apps use exact-route
@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -17,7 +17,7 @@ from urllib.parse import urlsplit
 
 from aiohttp import web
 
-from .compatibility import SUPPORTED_HA_DESCRIPTION, SUPPORTED_HA_VERSIONS
+from .compatibility import check_runtime_contracts
 
 PROVIDER_TYPE = "tsidp"
 BROWSER_COOKIE = "__Host-tsidp-browser"
@@ -38,7 +38,7 @@ async def _authorize_html(handle: AdapterHandle, response: web.StreamResponse):
     encoding = response.charset or "utf-8"
     if isinstance(response, web.FileResponse):
         # FileResponse has no body and defaults to octet-stream before prepare.
-        # _path is aiohttp-private: this stays in the version-pinned adapter.
+        # _path is aiohttp-private: this stays in the contract-checked adapter.
         path = Path(response._path)
         if response.content_type != "text/html" and (
             "Content-Type" in response.headers or path.suffix.lower() not in {".html", ".htm"}
@@ -107,7 +107,7 @@ class AdapterHandle:
         self.enabled = False
         for route, original, wrapper in self.route_handlers:
             if route.handler is wrapper:
-                route._handler = original  # HA/aiohttp-private, version-pinned here.
+                route._handler = original  # HA/aiohttp-private, contract-checked here.
         self.route_handlers.clear()
         providers = self.hass.auth._providers  # HA-private, isolated here.
         if providers.get((PROVIDER_TYPE, None)) is self.provider:
@@ -183,21 +183,36 @@ async def async_install(
     callback_url: str,
     header_identity: Any = None,
 ) -> AdapterHandle:
-    """Register once, during YAML setup, only on an exactly audited HA release."""
-    from homeassistant.const import __version__
+    """Register only after runtime contracts pass, independent of Core's date."""
+    # Run before private imports and before touching the provider registry/router.
+    # Source/metadata reads must not block Home Assistant's event loop.
+    await hass.async_add_executor_job(check_runtime_contracts)
+
+    if not isinstance(getattr(hass.auth, "_providers", None), MutableMapping) or not hasattr(
+        hass.auth, "_store"
+    ):
+        raise RuntimeError("Changed runtime auth provider registry/store contract")
+    for name in (
+        "get_auth_provider",
+        "async_get_user",
+        "async_get_user_by_credentials",
+        "async_link_user",
+    ):
+        if not callable(getattr(hass.auth, name, None)):
+            raise RuntimeError(f"Changed runtime auth manager contract: {name}")
 
     from .provider import TsidpAuthProvider
     from .views import BridgeView, CallbackView, StartView
 
-    if __version__ not in SUPPORTED_HA_VERSIONS:
-        raise RuntimeError(f"tsidp adapter supports Home Assistant {SUPPORTED_HA_DESCRIPTION} only")
     app = hass.http.app
+    if not isinstance(app, web.Application):
+        raise RuntimeError("Changed runtime HTTP application contract")
     if app.router.frozen:
         raise RuntimeError("tsidp cannot register views on a frozen HTTP router")
     frozen_app = app.frozen or app.middlewares.frozen
     target_routes = []
     if frozen_app:
-        # Both audited HA releases deliberately disable router.freeze on start,
+        # Audited HA releases deliberately disable router.freeze on start,
         # but aiohttp freezes the application/middleware list normally. Do not
         # unfreeze either object: wrap only the two already-existing GET routes.
         for path in (AUTHORIZE_PATH, "/auth/providers"):
@@ -226,6 +241,8 @@ async def async_install(
         f"{parsed.scheme}://{parsed.netloc}",
         header_identity=header_identity,
     )
+    if provider.support_mfa is not True:
+        raise RuntimeError("Native provider no longer guarantees MFA support")
     await provider.async_initialize()
     handle = AdapterHandle(hass, provider)
     # HA-private auth registration stays isolated here; route._handler is the

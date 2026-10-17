@@ -14,6 +14,9 @@ def prepare_sources(tmp_path, monkeypatch):
     (component / "manifest.json").write_text(json.dumps({"version": "0.1.0"}))
     (component / "__init__.py").write_text('"""Test fixture."""\n')
     (component / "frontend.js").write_text("// Login restart bridge\n")
+    (component / "strings.json").write_text('{"issues": {}}\n')
+    (component / "translations").mkdir()
+    (component / "translations" / "en.json").write_text('{"issues": {}}\n')
     (component / "private.token").write_text("never-ship-this")
     (component / "__pycache__").mkdir()
     (component / "__pycache__" / "compiled.pyc").write_bytes(b"never-ship-this")
@@ -37,6 +40,8 @@ def test_reproducible_release_and_no_caches_or_credentials(tmp_path, monkeypatch
             "custom_components/tsidp/__init__.py",
             "custom_components/tsidp/frontend.js",
             "custom_components/tsidp/manifest.json",
+            "custom_components/tsidp/strings.json",
+            "custom_components/tsidp/translations/en.json",
         ]
         assert all(info.date_time == (2026, 1, 1, 0, 0, 0) for info in archive.infolist())
 
@@ -53,7 +58,13 @@ def test_hacs_release_has_installable_root_layout_and_stable_checksum(tmp_path, 
     # HACS extracts release ZIPs straight into custom_components/<domain>/.
     installed = tmp_path / "ha-config" / "custom_components" / "tsidp"
     with ZipFile(artifact) as archive:
-        assert sorted(archive.namelist()) == ["__init__.py", "frontend.js", "manifest.json"]
+        assert sorted(archive.namelist()) == [
+            "__init__.py",
+            "frontend.js",
+            "manifest.json",
+            "strings.json",
+            "translations/en.json",
+        ]
         assert all(info.date_time == (2026, 1, 1, 0, 0, 0) for info in archive.infolist())
         assert all(info.create_system == 3 for info in archive.infolist())
         archive.extractall(installed)

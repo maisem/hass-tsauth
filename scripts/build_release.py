@@ -16,7 +16,8 @@ def component_files() -> list[Path]:
     return (
         sorted(COMPONENT.glob("*.py"))
         + sorted(COMPONENT.glob("*.js"))
-        + [COMPONENT / "manifest.json"]
+        + sorted(COMPONENT.glob("*.json"))
+        + sorted((COMPONENT / "translations").glob("*.json"))
     )
 
 

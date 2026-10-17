@@ -2,7 +2,8 @@
 
 **Log into Home Assistant with Tailscale. No OIDC server needed.**
 
-Requires **HA 2026.9.3 or 2026.10.1**, [HACS](https://www.hacs.xyz/docs/use/), and
+Audited on **HA 2026.9.3, 2026.10.1 and 2026.10.2**. Other versions use
+the same runtime safety checks, not a calendar block. Requires [HACS](https://www.hacs.xyz/docs/use/), and
 [Tailscale Serve](https://tailscale.com/kb/1312/serve) proxying your HTTPS tailnet
 address to HA. Keep your existing HA password login enabled.
 
@@ -48,7 +49,11 @@ The HA frontend and official iOS/Android apps are supported.
 - **Password page?** Tagged devices have no personal identity. Check your exact
   login mapping, Serve URL and proxy source IP. Missing/unmapped headers use passwords.
 - **Need password login?** Append `&tsidp_local=1` to `/auth/authorize?...`.
-- **Updates:** Update in HACS, then restart. Other HA versions are blocked.
+- **Updates:** Update in HACS, then restart. New HA versions warn, but do not
+  disable login just because the version changed. A changed native security
+  contract disables only SSO; the integration stays loaded and creates a
+  persistent **Settings → System → Repairs** error. Use your password and MFA
+  until a compatible release is installed.
 - **Remove:** Delete the `tsidp:` block, restart, then optionally remove in HACS.
 
 <details>
@@ -75,5 +80,8 @@ Without HACS, download `tsidp-VERSION.zip` from GitHub Releases (not `tsidp.zip`
 copy `custom_components/tsidp` into `/config/custom_components/`, configure and restart.
 
 </details>
+
+See [compatibility audit and local tests](docs/compatibility.md) for the safety
+policy, upstream comparisons and reproducible test commands.
 
 MIT licensed.

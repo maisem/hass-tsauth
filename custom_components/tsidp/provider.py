@@ -52,12 +52,24 @@ class TsidpAuthProvider(AuthProvider):
         async with self._credential_lock:
             for credential in await self.async_credentials():
                 if credential.data == {"issuer": issuer, "subject": subject}:
-                    linked = await self.hass.auth.async_get_user_by_credentials(credential)
-                    if linked is None or linked.id != user_id:
-                        raise InvalidAuthError("Existing credential has a different binding")
-                    return credential
-            credential = self.async_create_credentials({"issuer": issuer, "subject": subject})
-            await self.hass.auth.async_link_user(user, credential)
+                    break
+            else:
+                credential = self.async_create_credentials({"issuer": issuer, "subject": subject})
+                await self.hass.auth.async_link_user(user, credential)
+            # Native finish-flow only runs MFA for a non-new, already linked
+            # credential. Assert that contract on both reused and new paths.
+            linked = await self.hass.auth.async_get_user_by_credentials(credential)
+            if (
+                credential.is_new is not False
+                or linked is None
+                or linked.id != user_id
+                or not linked.is_active
+                or linked.system_generated
+            ):
+                raise InvalidAuthError(
+                    "Credential has a different binding or is not linked "
+                    "to the active bound account"
+                )
             return credential
 
     async def async_user_meta_for_credentials(self, credentials):

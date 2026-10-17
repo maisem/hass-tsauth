@@ -22,6 +22,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from homeassistant.auth import InvalidAuthError, auth_manager_from_config
 from homeassistant.auth.mfa_modules import MultiFactorAuthModule
+from homeassistant.components import auth as ha_auth
 from homeassistant.components.auth import TokenView, _create_auth_code_store
 from homeassistant.components.auth import login_flow as ha_login_flow
 from homeassistant.components.auth.login_flow import (
@@ -49,6 +50,8 @@ from custom_components.tsidp.ha_adapter import (
 from custom_components.tsidp.headers import LOGIN_HEADER, SERVE_ISSUER, HeaderIdentity
 from custom_components.tsidp.oidc import Authorization, Identity
 from custom_components.tsidp.session import SessionManager, new_browser_secret
+
+HAS_NATIVE_PKCE = hasattr(ha_auth, "AuthCodeEntry")
 
 ORIGIN = "https://ha.example.test"
 ISSUER = "https://idp.example.test"
@@ -219,7 +222,7 @@ async def test_stock_ha_code_issuance_links_existing_owner(runtime, client_id, r
     entry = runtime.retrieve_code(client_id, code)
     assert entry is not None
     # Native 2026.10.1 wraps credentials with optional PKCE metadata.
-    credential = entry.credentials if __version__ == "2026.10.1" else entry
+    credential = entry.credentials if hasattr(entry, "credentials") else entry
     assert await runtime.hass.auth.async_get_user_by_credentials(credential) is runtime.owner
     assert runtime.retrieve_code(client_id, code) is None
     assert len(await runtime.hass.auth.async_get_users()) == 1
@@ -457,7 +460,7 @@ PKCE = {
 PKCE_VERIFIER = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
 
 
-@pytest.mark.skipif(__version__ != "2026.10.1", reason="Native PKCE added in 2026.10.1")
+@pytest.mark.skipif(not HAS_NATIVE_PKCE, reason="Native Core has no PKCE support")
 @pytest.mark.parametrize("runtime", [None, "frozen", "headers", "headers_frozen"], indirect=True)
 @pytest.mark.parametrize("verifier", [None, "x" * 43, PKCE_VERIFIER])
 async def test_native_pkce_code_exchange_preserves_proof_and_existing_owner(runtime, verifier):
@@ -516,7 +519,7 @@ async def test_native_non_pkce_client_still_exchanges_code(runtime):
     assert len(runtime.owner.refresh_tokens) == 1
 
 
-@pytest.mark.skipif(__version__ != "2026.10.1", reason="Native PKCE added in 2026.10.1")
+@pytest.mark.skipif(not HAS_NATIVE_PKCE, reason="Native Core has no PKCE support")
 async def test_native_pkce_survives_entire_oidc_handoff_and_mfa(runtime):
     """Mock only the IdP; real HA HTTP/provider/MFA/code/token processing."""
     runtime.hass.auth._mfa_modules["test"] = TestMFA(runtime.hass, {"type": "test"})
@@ -582,7 +585,7 @@ async def test_headers_entire_handoff_native_tokens_and_optional_mfa(runtime, mf
     if mfa:
         runtime.hass.auth._mfa_modules["test"] = TestMFA(runtime.hass, {"type": "test"})
     client_id, redirect_uri = ORIGIN + "/", ORIGIN + "/?auth_callback=1"
-    pkce = PKCE if __version__ == "2026.10.1" else {}
+    pkce = PKCE if HAS_NATIVE_PKCE else {}
     query = urlencode(
         {"client_id": client_id, "redirect_uri": redirect_uri, "state": "a+b/=", **pkce}
     )
@@ -796,7 +799,11 @@ async def test_oidc_credentials_and_refresh_session_survive_header_mode(runtime)
 async def test_exact_bundled_frontend_html_bridge_contract(runtime):
     """Read the real installed frontend, not our simplified HTML fixture."""
     package = pytest.importorskip("hass_frontend", reason="Install the audited frontend wheel")
-    expected_version = {"2026.9.3": "20260826.7", "2026.10.1": "20260930.3"}[__version__]
+    expected_version = {
+        "2026.9.3": "20260826.7",
+        "2026.10.1": "20260930.3",
+        "2026.10.2": "20260930.4",
+    }[__version__]
     assert metadata.version("home-assistant-frontend") == expected_version
     html = (Path(package.__file__).parent / "authorize.html").read_text()
     assert 'import("/frontend_latest/authorize.' in html
@@ -806,3 +813,75 @@ async def test_exact_bundled_frontend_html_bridge_contract(runtime):
     response = await _authorize_html(runtime.handle, native)
     assert response.text == html.replace("<head>", "<head>" + BRIDGE_SCRIPT, 1)
     assert response.text.index(BRIDGE_SCRIPT) < response.text.index('import("/frontend_latest/')
+
+
+@pytest.mark.parametrize("runtime", ["frozen"], indirect=True)
+async def test_future_core_same_contracts_installs_and_clears_prior_repair(runtime, monkeypatch):
+    """No calendar gate, including at the actual YAML/Repairs integration edge."""
+    from homeassistant import const
+    from homeassistant.helpers import issue_registry as ir
+
+    from custom_components.tsidp import COMPATIBILITY_ISSUE
+
+    runtime.handle.disable()
+    monkeypatch.setattr(const, "__version__", "2027.1.0")
+    ir.async_create_issue(
+        runtime.hass,
+        "tsidp",
+        COMPATIBILITY_ISSUE,
+        is_fixable=False,
+        is_persistent=True,
+        severity=ir.IssueSeverity.ERROR,
+        translation_key="runtime_compatibility",
+        translation_placeholders={"reason": "old failure"},
+    )
+    config = {
+        "tsidp": {
+            "auth_mode": "headers",
+            "base_url": ORIGIN,
+            "trusted_proxies": ["127.0.0.1"],
+            "users": {"owner@example.test": runtime.owner.id},
+        }
+    }
+    assert await async_setup(runtime.hass, config) is True
+    installed = runtime.hass.data["tsidp"]
+    try:
+        assert runtime.hass.auth.get_auth_provider("tsidp", None) is installed.provider
+        assert ir.async_get(runtime.hass).async_get_issue("tsidp", COMPATIBILITY_ISSUE) is None
+    finally:
+        installed.disable()
+
+
+@pytest.mark.parametrize("runtime", ["frozen"], indirect=True)
+async def test_changed_native_contract_keeps_component_loaded_with_real_ha_repair(
+    runtime, monkeypatch
+):
+    from homeassistant.helpers import issue_registry as ir
+
+    from custom_components.tsidp import COMPATIBILITY_ISSUE, ha_adapter
+
+    runtime.handle.disable()
+
+    def incompatible():
+        raise RuntimeError("Changed native security contract: MFA")
+
+    monkeypatch.setattr(ha_adapter, "check_runtime_contracts", incompatible)
+    config = {
+        "tsidp": {
+            "auth_mode": "headers",
+            "base_url": ORIGIN,
+            "trusted_proxies": ["127.0.0.1"],
+            "users": {"owner@example.test": runtime.owner.id},
+        }
+    }
+    assert await async_setup(runtime.hass, config) is True
+    assert "compatibility_error" in runtime.hass.data["tsidp"]
+    assert runtime.hass.auth.get_auth_provider("tsidp", None) is None
+    assert runtime.hass.auth.get_auth_provider("homeassistant", None) is not None
+    issue = ir.async_get(runtime.hass).async_get_issue("tsidp", COMPATIBILITY_ISSUE)
+    assert issue is not None and issue.is_persistent
+    assert issue.severity is ir.IssueSeverity.ERROR
+    for route in runtime.hass.http.app.router.routes():
+        path = route.get_info().get("path")
+        if route.method == "GET" and path is not None and path in runtime.originals:
+            assert route.handler is runtime.originals[path]

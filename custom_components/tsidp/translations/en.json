@@ -1,0 +1,8 @@
+{
+  "issues": {
+    "runtime_compatibility": {
+      "title": "Tailscale Login needs a compatibility review",
+      "description": "Tailscale Login remains loaded, but automatic sign-in is disabled: {reason}.\n\nUse your existing Home Assistant password login and MFA. Update Tailscale Login to a compatible release, then restart Home Assistant. Do not remove account, proxy, or MFA protections."
+    }
+  }
+}

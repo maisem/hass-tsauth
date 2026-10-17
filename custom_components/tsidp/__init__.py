@@ -1,8 +1,4 @@
-"""Focused Tailscale identity authentication for Home Assistant.
-
-No identities are linked by inferred email/username, and no new HA users are
-provisioned. Protocol/state modules remain independently testable.
-"""
+"""Tailscale authentication with explicit mappings and password fallback."""
 
 from __future__ import annotations
 
@@ -11,7 +7,7 @@ from typing import TYPE_CHECKING
 
 import voluptuous as vol
 
-from .compatibility import SUPPORTED_HA_DESCRIPTION, SUPPORTED_HA_VERSIONS
+from .compatibility import AUDITED_HA_VERSIONS
 from .configuration import DOMAIN, Settings, validate_mapping
 
 if TYPE_CHECKING:
@@ -19,60 +15,58 @@ if TYPE_CHECKING:
     from homeassistant.helpers.typing import ConfigType
 
 _LOGGER = logging.getLogger(__name__)
+COMPATIBILITY_ISSUE = "runtime_compatibility"
 CONFIG_SCHEMA = vol.Schema({vol.Optional(DOMAIN): validate_mapping}, extra=vol.ALLOW_EXTRA)
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Register one explicitly configured provider without changing local login."""
+    """Remain loaded with a visible repair if SSO cannot safely be installed."""
     if DOMAIN not in config:
         return True
 
-    # These are the only exact HA releases whose private APIs we have audited.
-    # Refuse untested versions before registering middleware or auth providers.
     from homeassistant.const import __version__  # noqa: PLC0415
+    from homeassistant.helpers import issue_registry as ir  # noqa: PLC0415
 
-    if __version__ not in SUPPORTED_HA_VERSIONS:
-        _LOGGER.error(
-            "tsidp supports Home Assistant %s only; local login unchanged",
-            SUPPORTED_HA_DESCRIPTION,
+    # Dates identify completed audits, not whether a runtime is safe to use.
+    if __version__ not in AUDITED_HA_VERSIONS:
+        _LOGGER.warning(
+            "Home Assistant %s has not been audited with tsidp; checking runtime contracts",
+            __version__,
         )
-        return False
-
-    from homeassistant.helpers.importlib import async_import_module  # noqa: PLC0415
-
-    adapter = await async_import_module(hass, f"{__package__}.ha_adapter")
-    protocol = await async_import_module(hass, f"{__package__}.oidc")
-    state = await async_import_module(hass, f"{__package__}.session")
-
     if DOMAIN in hass.data:
-        _LOGGER.error("tsidp is already installed; refusing a second provider")
-        return False
+        _LOGGER.warning("tsidp is already loaded; refusing a second provider")
+        return True
 
-    settings = Settings.from_mapping(config[DOMAIN])
-    # Re-check existing-account bindings BEFORE installing a publicly reachable callback.
-    for user_id in settings.users.values():
-        user = await hass.auth.async_get_user(user_id)
-        if user is None or not user.is_active or user.system_generated:
-            _LOGGER.error("tsidp user mapping refers to a missing, inactive or system HA account")
-            return False
-
-    oidc = None
-    header_identity = None
-    if settings.auth_mode == "headers":
-        from .headers import HeaderIdentity  # noqa: PLC0415
-
-        header_identity = HeaderIdentity(settings.trusted_proxies)
-    else:
-        oidc = protocol.OIDCClient(
-            protocol.OIDCConfig(
-                issuer=settings.issuer,
-                client_id=settings.client_id,
-                callback_url=settings.callback_url,
-                client_secret=settings.client_secret,
-            )
-        )
-    sessions = state.SessionManager()
     try:
+        from homeassistant.helpers.importlib import async_import_module  # noqa: PLC0415
+
+        # Import/construction incompatibilities must also produce a loaded,
+        # degraded integration rather than silently disappearing from HA.
+        adapter = await async_import_module(hass, f"{__package__}.ha_adapter")
+        protocol = await async_import_module(hass, f"{__package__}.oidc")
+        state = await async_import_module(hass, f"{__package__}.session")
+        settings = Settings.from_mapping(config[DOMAIN])
+        for user_id in settings.users.values():
+            user = await hass.auth.async_get_user(user_id)
+            if user is None or not user.is_active or user.system_generated:
+                raise ValueError("Mapping refers to a missing, inactive or system HA account")
+
+        oidc = None
+        header_identity = None
+        if settings.auth_mode == "headers":
+            from .headers import HeaderIdentity  # noqa: PLC0415
+
+            header_identity = HeaderIdentity(settings.trusted_proxies)
+        else:
+            oidc = protocol.OIDCClient(
+                protocol.OIDCConfig(
+                    issuer=settings.issuer,
+                    client_id=settings.client_id,
+                    callback_url=settings.callback_url,
+                    client_secret=settings.client_secret,
+                )
+            )
+        sessions = state.SessionManager()
         handle = await adapter.async_install(
             hass,
             oidc=oidc,
@@ -81,10 +75,22 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
             callback_url=settings.callback_url,
             header_identity=header_identity,
         )
-    except (RuntimeError, ValueError):
-        _LOGGER.exception("Unable to install tsidp; keep the local password provider enabled")
-        return False
+    except (RuntimeError, ValueError, ImportError, AttributeError, TypeError) as err:
+        _LOGGER.exception("Unable to install tsidp SSO; existing password login remains enabled")
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            COMPATIBILITY_ISSUE,
+            is_fixable=False,
+            is_persistent=True,
+            severity=ir.IssueSeverity.ERROR,
+            translation_key="runtime_compatibility",
+            translation_placeholders={"reason": str(err)},
+        )
+        hass.data[DOMAIN] = {"compatibility_error": str(err)}
+        return True
 
     hass.data[DOMAIN] = handle
+    ir.async_delete_issue(hass, DOMAIN, COMPATIBILITY_ISSUE)
     _LOGGER.info("Tailscale authentication configured with explicit existing-account bindings")
     return True
