@@ -1,4 +1,4 @@
-# Compatibility and 2026.10.2 restoration (v0.2.1)
+# Compatibility (v0.2.3, audited through Core 2026.11.1)
 
 ## Policy
 
@@ -8,14 +8,17 @@ preflight. There is no frontend-build or aiohttp-version allowlist.
 
 Before changing providers/routes, the adapter checks actual auth registry,
 required auth methods, application and (for a frozen app) exact GET route shapes.
-Only five native security-sensitive callables are fingerprinted: finish-flow's
-mapping/MFA path, native MFA validation, code-issuance response, one-use code store,
-and authorization-code/PKCE exchange. Fingerprints use function ASTs, ignoring
+Only native security-sensitive callables are fingerprinted: the MFA enforcement
+point and MFA validation (one complete reviewed layout must match, see 2026.11.1
+below), code-issuance response, one-use code store, and authorization-code/PKCE
+exchange. Fingerprints use function ASTs, ignoring
 comments, formatting and docstrings; unrelated module changes are not checked.
 Changed security implementations or unavailable source require review. These
 fingerprints are conservative checks, not a claim to prove arbitrary new HA safe.
 
-The provider must explicitly support native MFA. Both reused and newly linked
+The login flow must finish through native MFA: on Core ≤ 2026.10 the provider
+must report `support_mfa`; on 2026.11 the flow must inherit `MfaLoginFlow.async_finish`
+unchanged, exactly as the native password flow does. Both reused and newly linked
 credentials must be non-new and linked to the intended active, non-system account
 before being returned to native finish-flow. Proxy trust, explicit account mapping,
 one-use browser-bound tickets/state, native client/redirect binding and S256 PKCE
@@ -32,6 +35,34 @@ A future frontend change could still break automatic provider selection/restart
 request, account and MFA checks remain authoritative; use password login if needed.
 
 ## Official upstream audit
+
+### Core 2026.11.1 (frontend 20261028.5, aiohttp 3.14.5)
+
+Compared with 2026.10.2/2026.10.4. All five fingerprinted functions changed:
+
+- **MFA moved.** `AuthManagerFlowManager.async_finish_flow` no longer challenges;
+  `AuthProvider.support_mfa` is gone. The challenge is now
+  `MfaLoginFlow.async_finish` (`homeassistant/auth/providers/__init__.py`), used by
+  the password, command-line and example providers. A plain `LoginFlow` (as
+  trusted networks uses) is **not** challenged. v0.2.2 and earlier derive from
+  `LoginFlow` and would skip MFA on 2026.11 had the guard not refused to install.
+  v0.2.3 derives from `MfaLoginFlow` when Core has it, and the adapter refuses
+  an overridden `async_finish`. `async_step_mfa` moved with it; it differs only
+  in calling the base `async_finish` after a valid code.
+- `_async_flow_result_to_response`: redirect check also receives the request
+  scheme/host. `_create_auth_code_store`: expired codes are purged on store.
+  `_async_handle_auth_code`: client check receives scheme/host, codes of removed
+  credentials are refused, duplicate new credentials are refused. All stricter;
+  this integration only ever returns linked, non-new credentials.
+- `indieauth.verify_client_id`/`verify_redirect_uri` require `request_scheme` and
+  `request_netloc`; `/auth/tsidp/start` passes them as Core's own views do.
+- `async_create_flow` asks `async_can_start_login` (inherited, always true) and
+  raises `UnknownHandler`; nothing here catches the former `KeyError`.
+- Unchanged: `/auth/authorize` static file route, `/auth/providers` JSON shape,
+  disabled router freeze, `_providers`/`_store`. Frontend auth sources only gain
+  `response_type` forwarding; picker and event helper are identical.
+
+### Core 2026.10.2
 
 Compared the official release tags and installed release wheels:
 
@@ -54,8 +85,9 @@ Compared the official release tags and installed release wheels:
 ## Bounded local validation (no live HA)
 
 The Python 3.14 environments are separate: `.venv-ha` (2026.9.3),
-`.venv-ha-202610` (2026.10.1), `.venv-ha-2026102` (2026.10.2).
-The latter contains `home-assistant-frontend==20260930.4` and aiohttp 3.14.5.
+`.venv-ha-202610` (2026.10.1), `.venv-ha-2026102` (2026.10.2) and
+`.venv-ha-2026111` (2026.11.1, `home-assistant-frontend==20261028.5`,
+`httpx2==2.14.0`). The 2026.10.2 one was created as follows; substitute versions.
 
 ```sh
 uv venv --python .venv-ha-202610/bin/python .venv-ha-2026102

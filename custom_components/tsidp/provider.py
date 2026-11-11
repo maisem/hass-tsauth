@@ -8,12 +8,17 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from homeassistant.auth import InvalidAuthError
+from homeassistant.auth import providers as native_providers
 from homeassistant.auth.providers import AuthProvider, LoginFlow
 from homeassistant.helpers.http import current_request
 
 from .clients import is_trusted_client
 from .ha_adapter import BROWSER_COOKIE, PROVIDER_TYPE, TICKET_COOKIE
 from .session import SessionError, validate_authorize_path
+
+# Core 2026.11 moved the MFA challenge out of finish-flow into MfaLoginFlow,
+# the base of the native password flow. A plain LoginFlow would skip MFA there.
+MFA_FLOW = getattr(native_providers, "MfaLoginFlow", None)
 
 
 class TsidpAuthProvider(AuthProvider):
@@ -56,8 +61,8 @@ class TsidpAuthProvider(AuthProvider):
             else:
                 credential = self.async_create_credentials({"issuer": issuer, "subject": subject})
                 await self.hass.auth.async_link_user(user, credential)
-            # Native finish-flow only runs MFA for a non-new, already linked
-            # credential. Assert that contract on both reused and new paths.
+            # Native MFA only runs for a non-new, already linked credential.
+            # Assert that contract on both reused and new paths.
             linked = await self.hass.auth.async_get_user_by_credentials(credential)
             if (
                 credential.is_new is not False
@@ -78,7 +83,7 @@ class TsidpAuthProvider(AuthProvider):
         raise InvalidAuthError("Automatic account provisioning is disabled")
 
 
-class TsidpLoginFlow(LoginFlow):
+class TsidpLoginFlow(MFA_FLOW or LoginFlow):
     """Finish through HA's ordinary credential and MFA processing, not token minting."""
 
     async def async_step_init(self, user_input=None):
@@ -132,7 +137,8 @@ class TsidpLoginFlow(LoginFlow):
         if user is None or not user.is_active or user.system_generated:
             return self.async_abort(reason="invalid_auth")
         # Returning a mapping rather than a Credentials object is important:
-        # AuthManagerFlowManager.async_finish_flow then runs HA's existing MFA.
+        # native async_finish (2026.11) or finish-flow (older) then runs HA's MFA.
+        # async_finish must stay inherited; the adapter refuses an override.
         return await self.async_finish(
             {
                 "issuer": identity.issuer,

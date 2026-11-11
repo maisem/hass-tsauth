@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Mapping
 from html import escape
 from pathlib import Path
@@ -59,6 +60,13 @@ def _one(query, name: str, *, required: bool = True) -> str:
     return values[0] if values else ""
 
 
+def _served_from(request: web.Request) -> dict[str, str]:
+    """Core 2026.11 validates a client against the scheme and host that served it."""
+    if "request_netloc" not in inspect.signature(indieauth.verify_client_id).parameters:
+        return {}
+    return {"request_scheme": request.scheme, "request_netloc": request.host}
+
+
 class BridgeView(HomeAssistantView):
     """Public same-origin script loaded only by the native authorize HTML."""
 
@@ -106,9 +114,12 @@ class StartView(HomeAssistantView):
             )
             if not is_trusted_client(self.handle.provider.origin, client_id, redirect_uri):
                 return _failure(403, return_path)
-            if not indieauth.verify_client_id(client_id):
+            served = _served_from(request)
+            if not indieauth.verify_client_id(client_id, **served):
                 raise ValueError("Invalid client")
-            if not await indieauth.verify_redirect_uri(self.handle.hass, client_id, redirect_uri):
+            if not await indieauth.verify_redirect_uri(
+                self.handle.hass, client_id, redirect_uri, **served
+            ):
                 raise ValueError("Invalid redirect")
             browser = request.cookies.get(BROWSER_COOKIE) or new_browser_secret()
             header_identity = self.handle.provider.header_identity

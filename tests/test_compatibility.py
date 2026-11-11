@@ -23,6 +23,7 @@ def test_only_named_security_callables_are_checked(monkeypatch):
         "SECURITY_CONTRACTS",
         {"future.module:Finish.run": (compatibility.security_fingerprint(native_finish),)},
     )
+    monkeypatch.setattr(compatibility, "MFA_LAYOUTS", ({},))
     compatibility.check_runtime_contracts()
     good.unrelated = "a harmless future release changed unrelated auth/frontend code"
     compatibility.check_runtime_contracts()
@@ -44,4 +45,27 @@ def test_source_comments_formatting_and_docstrings_do_not_disable_sso(monkeypatc
 def test_missing_native_security_contract_requires_review(monkeypatch):
     monkeypatch.setattr(compatibility, "import_module", lambda _: SimpleNamespace())
     with pytest.raises(RuntimeError, match="Required native security callable/source"):
+        compatibility.check_runtime_contracts()
+
+
+def test_mfa_enforcement_must_match_one_whole_reviewed_layout(monkeypatch):
+    """Core 2026.11 moved MFA; hashes of the old and new place never mix."""
+    old, new = (compatibility.security_fingerprint(f) for f in (native_finish, changed_finish))
+    layouts = (
+        {"core:Manager.finish": old, "core:MfaFlow": None},
+        {"core:Manager.finish": new, "core:MfaFlow.finish": old},
+    )
+    monkeypatch.setattr(compatibility, "SECURITY_CONTRACTS", {})
+    monkeypatch.setattr(compatibility, "MFA_LAYOUTS", layouts)
+    core = SimpleNamespace(Manager=SimpleNamespace(finish=native_finish))
+    monkeypatch.setattr(compatibility, "import_module", lambda _: core)
+    compatibility.check_runtime_contracts()
+    core.Manager.finish = changed_finish
+    with pytest.raises(RuntimeError, match="MFA enforcement"):
+        compatibility.check_runtime_contracts()
+    core.MfaFlow = SimpleNamespace(finish=native_finish)
+    compatibility.check_runtime_contracts()
+    # The old manager together with the new flow class was never reviewed.
+    core.Manager.finish = native_finish
+    with pytest.raises(RuntimeError, match="MFA enforcement"):
         compatibility.check_runtime_contracts()

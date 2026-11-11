@@ -277,6 +277,20 @@ async def test_native_ha_mfa_not_bypassed(runtime):
     assert runtime.retrieve_code(client_id, completed["result"]) is not None
 
 
+async def test_login_flow_finishes_exactly_like_the_native_password_flow(runtime):
+    """Core 2026.11 challenges only MfaLoginFlow subclasses; older Core any provider."""
+    from homeassistant.auth import providers as native
+    from homeassistant.auth.providers.homeassistant import HassLoginFlow
+
+    flow = await runtime.provider.async_login_flow({})
+    assert type(flow).async_finish is HassLoginFlow.async_finish
+    if hasattr(native, "MfaLoginFlow"):
+        assert isinstance(flow, native.MfaLoginFlow)
+        assert not hasattr(runtime.provider, "support_mfa")
+    else:
+        assert runtime.provider.support_mfa is True
+
+
 async def test_original_password_provider_still_runs_its_native_challenge(runtime):
     response = await runtime.client.post(
         "/auth/login_flow",
@@ -803,6 +817,7 @@ async def test_exact_bundled_frontend_html_bridge_contract(runtime):
         "2026.9.3": "20260826.7",
         "2026.10.1": "20260930.3",
         "2026.10.2": "20260930.4",
+        "2026.11.1": "20261028.5",
     }[__version__]
     assert metadata.version("home-assistant-frontend") == expected_version
     html = (Path(package.__file__).parent / "authorize.html").read_text()

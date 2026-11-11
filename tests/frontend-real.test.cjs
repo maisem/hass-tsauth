@@ -1,4 +1,4 @@
-/* Optional contract tests against the installed, unmodified HA 20260930.3 bundle.
+/* Optional contract tests against an installed, unmodified, audited HA frontend bundle.
  * TSIDP_HA_FRONTEND=/path/to/hass_frontend node --test tests/*.test.cjs
  * Only Lit rendering/decorators are stubbed; native auth, picker and event
  * implementation functions below are executed directly from the real wheel.
@@ -14,15 +14,37 @@ const options = { skip: !root && 'Set TSIDP_HA_FRONTEND to the audited frontend 
 const challenge = 'E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM';
 const query = `client_id=https%3a%2f%2fha.example.test%2f&redirect_uri=https%3a%2f%2fha.example.test%2f%3fauth_callback%3d1&state=a%2Bb%2Fc%3D&code_challenge=${challenge}&code_challenge_method=S256`;
 
+// Minified names differ per audited build; the native sources executed are the same.
+const BUNDLES = [
+  { // 20260930.x (Core 2026.10)
+    table: 'r', tableEnd: '},a={};function o(e){', picker: /^6917\.[^.]+\.js$/,
+    fire: 'o.detail=r,e.dispatchEvent(o)',
+    ids: { lit: 20686, tslib: 89797, decorators: 32379, localize: 70465, fire: 86075 },
+  },
+  { // 20261028.5 (Core 2026.11.1)
+    table: 'a', tableEnd: '},r={};function o(e){', picker: /^14633\.[^.]+\.js$/,
+    fire: 'o.detail=a,e.dispatchEvent(o)',
+    ids: { lit: 70341, tslib: 50026, decorators: 51010, localize: 98088, fire: 88558 },
+  },
+];
+
+function bundle() {
+  const names = fs.readdirSync(path.join(root, 'frontend_latest'));
+  const found = BUNDLES.find(shape => names.some(name => shape.picker.test(name)));
+  assert.ok(found, 'Audited native picker chunk must exist');
+  return found;
+}
+
 function nativeModules(context) {
   const directory = path.join(root, 'frontend_latest');
+  const shape = bundle();
   const file = fs.readdirSync(directory).find(name => /^authorize\.[^.]+\.js$/.test(name));
   const source = fs.readFileSync(path.join(directory, file), 'utf8');
   // Load module definitions without starting the browser entrypoint/runtime.
   // Fail on a changed bundler shape rather than pretending a new audit passed.
-  const end = source.indexOf('},a={};function o(e){');
+  const end = source.indexOf(shape.tableEnd);
   assert.ok(end > 0, 'Audited Rspack module table must exist');
-  vm.runInContext(source.slice(0, end + 1) + ';globalThis.modules=r;', context);
+  vm.runInContext(source.slice(0, end + 1) + `;globalThis.modules=${shape.table};`, context);
   return context.modules;
 }
 
@@ -102,6 +124,10 @@ test('real new frontend submits native S256 fields through the unchanged bridge'
     code_challenge_method: 'S256',
   });
   assert.deepEqual(b.navigations, []);
+  // 20261028.5 forwards response_type; Core 2026.11.1 accepts only "code".
+  await b.createFlow('c', 'r', ['tsidp', null], challenge, 'S256', 'code');
+  const forwarded = JSON.parse(b.requests[1].init.body).response_type;
+  assert.equal(forwarded, bundle().table === 'a' ? 'code' : undefined);
 });
 
 test('real new frontend ticketless POST restarts with opaque state and PKCE intact', options, async () => {
@@ -113,16 +139,16 @@ test('real new frontend ticketless POST restarts with opaque state and PKCE inta
 });
 
 test('real picker and composed native event restart only Tailscale selection', options, () => {
+  const shape = bundle();
   for (const type of ['tsidp', 'homeassistant']) {
     const b = browser({});
     const fireDefinition = Object.values(b.modules).find(fn =>
-      fn.toString().includes('o.detail=r,e.dispatchEvent(o)'),
+      fn.toString().includes(shape.fire),
     );
     assert.ok(fireDefinition, 'Native composed event helper must exist');
     const fire = loadModule(fireDefinition);
     const directory = path.join(root, 'frontend_latest');
-    const chunk = fs.readdirSync(directory).find(name => /^6917\.[^.]+\.js$/.test(name));
-    assert.ok(chunk, 'Audited native picker chunk must exist');
+    const chunk = fs.readdirSync(directory).find(name => shape.picker.test(name));
     const source = fs.readFileSync(path.join(directory, chunk), 'utf8').replaceAll('export const ', 'const ');
     vm.runInContext(source + '\n;globalThis.pickerModules=__webpack_modules__;', b.context);
     const definition = Object.values(b.context.pickerModules).find(fn =>
@@ -131,11 +157,11 @@ test('real picker and composed native event restart only Tailscale selection', o
     assert.ok(definition, 'Native picker implementation must exist');
     const noDecorator = () => () => {};
     const dependencies = id => ({
-      20686: { WF: b.NativeTarget, AH: () => '' }, // Lit rendering only.
-      89797: { Cg: (_decorators, target) => target },
-      32379: { MZ: noDecorator, wk: noDecorator, EM: noDecorator },
-      70465: { IW: noDecorator },
-      86075: fire,
+      [shape.ids.lit]: { WF: b.NativeTarget, AH: () => '' }, // Lit rendering only.
+      [shape.ids.tslib]: { Cg: (_decorators, target) => target },
+      [shape.ids.decorators]: { MZ: noDecorator, wk: noDecorator, EM: noDecorator },
+      [shape.ids.localize]: { IW: noDecorator },
+      [shape.ids.fire]: fire,
     })[id] || {};
     const { HaPickAuthProvider } = loadModule(definition, dependencies);
     const picker = new HaPickAuthProvider();

@@ -784,6 +784,44 @@ async def test_native_provider_must_still_support_mfa_before_registration(ha):
     assert not ha.hass.http.app.middlewares
 
 
+def core_2026_11_provider():
+    """Core 2026.11 dropped support_mfa; only MfaLoginFlow subclasses are challenged."""
+    native = sys.modules["homeassistant.auth.providers"]
+
+    class MfaLoginFlow(native.LoginFlow):
+        async def async_finish(self, result):
+            return {"type": "form", "step_id": "mfa"}
+
+    native.MfaLoginFlow = MfaLoginFlow
+    del native.AuthProvider.support_mfa
+    # The fixture's teardown drops whichever provider module is loaded last.
+    sys.modules.pop("custom_components.tsidp.provider")
+    return importlib.import_module("custom_components.tsidp.provider"), MfaLoginFlow
+
+
+async def test_core_2026_11_login_flow_derives_from_native_mfa_flow(ha):
+    provider, mfa_flow = core_2026_11_provider()
+    assert issubclass(provider.TsidpLoginFlow, mfa_flow)
+    handle = await async_install(
+        ha.hass, oidc=object(), sessions=SessionManager(), bindings={}, callback_url=CALLBACK
+    )
+    flow = await handle.provider.async_login_flow({})
+    assert await flow.async_finish({}) == {"type": "form", "step_id": "mfa"}
+
+
+async def test_core_2026_11_refuses_a_flow_that_finishes_outside_native_mfa(ha, monkeypatch):
+    provider, _ = core_2026_11_provider()
+    monkeypatch.setattr(
+        provider.TsidpLoginFlow, "async_finish", provider.LoginFlow.async_finish, raising=False
+    )
+    with pytest.raises(RuntimeError, match="native MFA"):
+        await async_install(
+            ha.hass, oidc=object(), sessions=SessionManager(), bindings={}, callback_url=CALLBACK
+        )
+    assert list(ha.hass.auth._providers) == [("homeassistant", None)]
+    assert not ha.hass.http.app.middlewares
+
+
 @pytest.mark.parametrize("reused", [False, True])
 @pytest.mark.parametrize("failure", ["new", "unlinked", "other_user", "inactive", "system"])
 async def test_native_mfa_credential_link_invariants(ha, reused, failure):

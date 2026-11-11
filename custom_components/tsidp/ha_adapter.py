@@ -201,7 +201,7 @@ async def async_install(
         if not callable(getattr(hass.auth, name, None)):
             raise RuntimeError(f"Changed runtime auth manager contract: {name}")
 
-    from .provider import TsidpAuthProvider
+    from .provider import MFA_FLOW, TsidpAuthProvider, TsidpLoginFlow
     from .views import BridgeView, CallbackView, StartView
 
     app = hass.http.app
@@ -241,8 +241,13 @@ async def async_install(
         f"{parsed.scheme}://{parsed.netloc}",
         header_identity=header_identity,
     )
-    if provider.support_mfa is not True:
-        raise RuntimeError("Native provider no longer guarantees MFA support")
+    if MFA_FLOW is None:
+        # Core <= 2026.10: finish-flow challenges providers that support MFA.
+        if getattr(provider, "support_mfa", None) is not True:
+            raise RuntimeError("Native provider no longer guarantees MFA support")
+    elif TsidpLoginFlow.async_finish is not MFA_FLOW.async_finish:
+        # Core 2026.11: the challenge is MfaLoginFlow.async_finish itself.
+        raise RuntimeError("Login flow no longer finishes through native MFA support")
     await provider.async_initialize()
     handle = AdapterHandle(hass, provider)
     # HA-private auth registration stays isolated here; route._handler is the
