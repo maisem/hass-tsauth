@@ -1,7 +1,7 @@
 {
   "domain": "tsidp",
   "name": "Tailscale Login",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "documentation": "https://github.com/maisem/hass-tsauth",
   "dependencies": [
     "auth",
@@ -9,9 +9,9 @@
     "frontend"
   ],
   "requirements": [
-    "Authlib==1.9.1",
-    "httpx2==2.13.0",
-    "joserfc==1.7.5"
+    "Authlib>=1.9.1",
+    "httpx2>=2.13.0",
+    "joserfc>=1.7.5"
   ],
   "codeowners": [
     "@maisem"
